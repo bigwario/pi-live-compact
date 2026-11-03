@@ -1,0 +1,14 @@
+{
+  "name": "pi-live-compact",
+  "version": "0.1.0",
+  "description": "Live Compact for Pi: cut the newest finished chunk in place at 20K tokens with a local extractive card — no model call, prefix cache preserved. Ported from dsh-live-compact (MIT, MerkyorLynn).",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "compaction", "context"],
+  "pi": {
+    "extensions": ["./extensions/live-compact.ts"]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/plan.test.ts tests/select.test.ts"
+  }
+}
