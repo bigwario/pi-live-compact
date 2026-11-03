@@ -1,5 +1,7 @@
 # Live Compact for Pi（边做边压 · Pi 版）
 
+[中文](./README.md) | [English](./README.en.md)
+
 Live Compact 就是边做边压。活着的时候就压，不等窗口堆满。
 
 这是 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)（MerkyorLynn，MIT）
