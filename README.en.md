@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.0.1, and the host-mechanism differences are
+card algorithm match upstream 1.0.6, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -17,16 +17,28 @@ does not wait. Once the context exceeds **20,000 tokens**, at the end of every
 turn it cuts the **most recently finished chunk** locally — no model call, no
 new tools, done in milliseconds. Everything before the cut point is left
 untouched, so the prefix cache keeps hitting. The cut span is replaced by an
-extractive card (repeated identifiers, obligation lines, error headers and
-code lines preserved verbatim, within an 8K-character budget), and the cut
-only goes ahead when the card can prove that no hard line was lost
-(TRUNK CONFIRMED). Spans whose prose share is too high are not cut and are
+extractive card, and the cut only goes ahead when the card can prove that no
+hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
+
+Card semantics at 1.0.6 (synced with upstream):
+
+- **The newest 3 finished tool rounds stay verbatim** (within a combined
+  32K-token budget); the cut must end before they start.
+- Hard lines are claimed only from non-assistant messages, and kept lines are
+  tagged with their original role. Completion claims in assistant prose do not
+  count as hard lines; tool evidence records only the turn, the command, the
+  exit status and the call id.
+- Short tool results (≤12 lines and ≤512 chars) stay on the card verbatim.
+  Failed tool results are excerpted first, and failure is recognised only from
+  structural signals (non-zero exit codes, `isError`, `[stderr]` markers) —
+  never from keywords.
+- Every cut tool result leaves a pointer on the card: session entry id +
+  sha256 + byte count, so the original can be re-read when needed.
 
 One natural improvement over upstream: Pi session files are append-only and
 the cut entries stay on record, so upstream's append-only plaintext shadow
-directory is unnecessary — the card's trailer line references the session
-entry id range instead.
+directory is unnecessary — pointers reference the session entries directly.
 
 ## Installation
 
@@ -51,6 +63,8 @@ Same names and meanings as upstream:
 | Environment variable | Default | Purpose |
 |---|---|---|
 | `SPINE_MIN_TOKENS` | `20000` | Total-context threshold that triggers a small cut |
+| `SPINE_KEEP_ROUNDS` | `3` | Newest finished tool rounds kept verbatim before the cut |
+| `SPINE_KEEP_ROUND_TOKENS` | `32000` | Combined token budget for the kept rounds |
 
 The remaining constants match upstream's hard-coded values: 1K–32K tokens
 per cut, an 8,000-character keep budget, 2,200 tokens of tail protection, no
@@ -60,7 +74,7 @@ urgent cuts below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 10 cases covering the card builder and span selection
+npm test   # node --test, 17 cases covering the card builder and span selection
 ```
 
 ## License and origin

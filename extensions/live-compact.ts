@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.1
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.6
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -13,8 +13,8 @@
 // and Pi's own compaction remains in charge, mirroring the original's
 // "wait-80" route.
 
-import { estimateTokens } from "./plan.ts";
-import { selectNewestChunk, type SpanEntry } from "./select.ts";
+import { backgroundJobId, backupHint, callCommand, callFilePath, estimateTokens } from "./plan.ts";
+import { selectNewestChunk, type CallInfo, type SpanEntry } from "./select.ts";
 
 const BIG_GATE = 650000;
 const URGENT_TOKENS = 48000;
@@ -31,27 +31,47 @@ function messageText(message: any): string {
   const content = message?.content;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
-  return content.map(blockText).join("\n");
+  return content.map(blockText).filter((part) => part.length > 0).join("\n");
 }
 
 function toSpanEntries(projected: any[]): SpanEntry[] {
   const entries: SpanEntry[] = [];
+  const callIndex = new Map<string, CallInfo>();
+  let turn: number | null = null;
   for (const item of projected) {
     const messages = item?.messages ?? [];
     if (messages.length === 0) continue;
     const message = messages[0];
+    const role = typeof message?.role === "string" ? message.role : "custom";
+    if (role === "user") turn = (turn ?? 0) + 1;
     const content = Array.isArray(message?.content) ? message.content : [];
-    const toolCalls = content
-      .filter((b: any) => b?.type === "toolCall" && typeof b.id === "string")
-      .map((b: any) => b.id as string);
+    const toolCalls: string[] = [];
+    for (const block of content) {
+      if (block?.type === "toolCall" && typeof block.id === "string") {
+        toolCalls.push(block.id);
+        if (!callIndex.has(block.id)) {
+          callIndex.set(block.id, {
+            id: block.id,
+            name: typeof block.name === "string" ? block.name : "",
+            command: callCommand(typeof block.name === "string" ? block.name : "", block.arguments),
+            filePath: callFilePath(block.arguments),
+          });
+        }
+      }
+    }
     const text = messages.map(messageText).join("\n");
+    const toolResultFor = role === "toolResult" && typeof message.toolCallId === "string" ? message.toolCallId : null;
     entries.push({
       id: item.sourceEntry.id,
-      role: typeof message?.role === "string" ? message.role : "custom",
+      role,
       text,
       tokens: estimateTokens(text),
       toolCalls,
-      toolResultFor: message?.role === "toolResult" && typeof message.toolCallId === "string" ? message.toolCallId : null,
+      toolResultFor,
+      isError: message?.isError === true,
+      turn,
+      call: toolResultFor ? callIndex.get(toolResultFor) || null : null,
+      backgroundStart: toolResultFor ? Boolean(backgroundJobId(text)) : false,
     });
   }
   return entries;
@@ -67,13 +87,14 @@ export default function liveCompact(pi: any) {
 
     const chunk = selectNewestChunk(entries);
     if (!chunk) return;
-    if (chunk.after > MAX_TAIL && total < URGENT_TOKENS) return;
+    const tailBeyondKept = chunk.after - (chunk.keptTokens || 0);
+    if (tailBeyondKept > MAX_TAIL && total < URGENT_TOKENS) return;
 
     const span = entries.slice(chunk.start, chunk.end + 1);
     const cardText =
       `${chunk.card.text}\n` +
-      `Full shadowed text: session entries ${span[0].id}..${span[span.length - 1].id} ` +
-      `(raw entries are retained in this session file).`;
+      (chunk.card.needsBackup ? `${backupHint()}\n` : "") +
+      `整段原文：本会话条目 ${span[0].id}..${span[span.length - 1].id}（原始条目保留在会话文件里）。`;
     if (estimateTokens(cardText) >= chunk.tokens) return;
 
     const started = Date.now();
