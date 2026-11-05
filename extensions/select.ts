@@ -1,26 +1,45 @@
-// Span selection ported from dsh-live-compact 1.0.6 index.js
-// (selectNewestChunk). The DSH version walks a host session surface with a
-// per-node token meter; here the same walk runs over plain entry records the
-// extension builds from Pi's projected session entries. Pairing checks are
-// re-expressed over tool-call ids because Pi has no toolPairingBalanced*
-// helpers: a cut may not separate an assistant tool call from its result.
-// 1.0.6 addition: the newest finished tool rounds (default 3, within a
-// token budget) are reserved — the cut must end before they start.
+// Span selection ported from dsh-live-compact 1.0.8 index.js
+// (selectNewestChunk + plan.js selectCutIndexes). The DSH version walks a
+// host session surface with a per-node token meter; here the same walk runs
+// over plain entry records the extension builds from Pi's projected session
+// entries. Pairing checks are re-expressed over tool-call ids because Pi
+// has no toolPairingBalanced* helpers: a cut may not separate an assistant
+// tool call from its result. The newest finished tool rounds (default 3,
+// within a token budget) are reserved — the cut must end before they start.
+// 1.0.7/1.0.8: selection splits by engine — local cuts only after the last
+// user message; cloud cuts only oversized results below the drain line and
+// drains turn by turn once the total (plus predicted growth) passes it.
 
 import {
   buildCard,
   chooseKeptSpan,
   keptToolRounds,
   MARK,
+  pointerOnlyText,
+  pointerSpanAllowed,
   RAIL_TOKENS,
   reservedCutEnd,
+  selectCutIndexes,
+  TRUNK_SCOPE,
   type Card,
   type CardSpan,
+  type CutItem,
   type RoundEvent,
 } from "./plan.ts";
 
-export const CHUNK_MIN = 1000;
-export const CHUNK_MAX = RAIL_TOKENS;
+// CHUNK_MIN / CHUNK_MAX are hardcoded upstream; issue #15 proposes env
+// knobs with unchanged defaults. The port adopts that suggestion early
+// (PORTING.md): SPINE_CHUNK_MIN / SPINE_CHUNK_MAX, invariant MIN <= MAX.
+const rawChunkMin = Number.parseInt(process.env.SPINE_CHUNK_MIN || "", 10);
+const rawChunkMax = Number.parseInt(process.env.SPINE_CHUNK_MAX || "", 10);
+export const CHUNK_MAX = Number.isFinite(rawChunkMax) && rawChunkMax > 0 ? rawChunkMax : RAIL_TOKENS;
+export const CHUNK_MIN = Math.min(
+  Number.isFinite(rawChunkMin) && rawChunkMin > 0 ? rawChunkMin : 1000,
+  CHUNK_MAX,
+);
+const rawPointer = Number.parseInt(process.env.SPINE_POINTER_TOKENS || "", 10);
+export const POINTER_TOKENS = Number.isFinite(rawPointer) && rawPointer > 0 ? rawPointer : CHUNK_MAX;
+export const URGENT_TOKENS = 48000;
 export const KEEP_ROUNDS = Number(process.env.SPINE_KEEP_ROUNDS || 3);
 export const KEEP_ROUND_TOKENS = Number(process.env.SPINE_KEEP_ROUND_TOKENS || 32000);
 
@@ -42,6 +61,7 @@ export interface SpanEntry {
   turn?: number | null;
   call?: CallInfo | null;
   backgroundStart?: boolean;
+  seq: number;
 }
 
 export interface Chunk {
@@ -51,6 +71,7 @@ export interface Chunk {
   after: number;
   keptTokens: number;
   card: Card;
+  pointerOnly?: boolean;
 }
 
 export function isCardEntry(entry: SpanEntry): boolean {
@@ -78,7 +99,13 @@ function balancedBefore(entries: SpanEntry[], start: number): boolean {
   return callAt >= start;
 }
 
-function toCardSpan(entry: SpanEntry): CardSpan {
+function itemType(entry: SpanEntry): string {
+  if (entry.role === "toolResult") return "tool";
+  if (entry.role === "user" || entry.role === "assistant" || entry.role === "system") return entry.role;
+  return "other";
+}
+
+function toCardSpan(entry: SpanEntry, callSeqOf: Map<string, number>): CardSpan {
   return {
     role: entry.role,
     text: entry.text,
@@ -89,12 +116,20 @@ function toCardSpan(entry: SpanEntry): CardSpan {
     toolCallId: entry.toolResultFor || undefined,
     turn: entry.turn ?? null,
     backgroundStart: entry.backgroundStart,
-    entryId: entry.id,
+    seq: entry.seq,
+    callSeq: entry.toolResultFor ? callSeqOf.get(entry.toolResultFor) : undefined,
   };
 }
 
-export function selectNewestChunk(entries: SpanEntry[]): Chunk | null {
+export interface SelectOptions {
+  engine?: string;
+  totalTokens?: number;
+  drain?: boolean;
+}
+
+export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}): Chunk | null {
   if (entries.length === 0) return null;
+  const engine = opts.engine ?? "cloud";
   const first = entries[0].role === "system" ? 1 : 0;
   let end = entries.length - 1;
   while (end >= first) {
@@ -130,43 +165,108 @@ export function selectNewestChunk(entries: SpanEntry[]): Chunk | null {
     while (end >= first && (isCardEntry(entries[end]) || entries[end].role === "user")) end -= 1;
     while (end >= first && !balancedAfter(entries, first, end)) end -= 1;
   }
+  if (end < first) return null;
+  const maxEnd = end;
 
-  if (end < first || isCardEntry(entries[end])) return null;
-  if (entries[end].tokens > CHUNK_MAX) return null;
+  const items: CutItem[] = entries.map((entry, index) => ({
+    type: itemType(entry),
+    tokens: entry.tokens,
+    checkpoint: isCardEntry(entry),
+    balancedBefore: balancedBefore(entries, index),
+    balancedAfter: balancedAfter(entries, first, index),
+  }));
+  const picked = selectCutIndexes(items, {
+    engine,
+    chunkMin: CHUNK_MIN,
+    chunkMax: CHUNK_MAX,
+    pointerMax: POINTER_TOKENS,
+    maxEnd,
+    totalTokens: opts.totalTokens,
+    drain: opts.drain,
+    urgentTokens: URGENT_TOKENS,
+    keepBudget: KEEP_ROUND_TOKENS,
+  });
+  if (!picked) return null;
 
+  const callSeqOf = new Map<string, number>();
+  for (const entry of entries) {
+    for (const callId of entry.toolCalls) {
+      if (!callSeqOf.has(callId)) callSeqOf.set(callId, entry.seq);
+    }
+  }
   const spanText = (a: number, b: number) => entries.slice(a, b + 1).map((e) => e.text).join("\n");
   const liveText = (a: number, b: number) =>
     entries.filter((_, i) => i < a || i > b).map((e) => e.text).join("\n");
-  const spanObjs = (a: number, b: number) => entries.slice(a, b + 1).map(toCardSpan);
+  const spanObjs = (a: number, b: number) => entries.slice(a, b + 1).map((e) => toCardSpan(e, callSeqOf));
+  const sumTokens = (a: number, b: number) => {
+    let total = 0;
+    for (let i = a; i <= b; i += 1) total += entries[i].tokens;
+    return total;
+  };
+  const afterOf = (at: number) => {
+    let after = 0;
+    for (let i = at + 1; i < entries.length; i += 1) after += entries[i].tokens;
+    return after;
+  };
 
-  let start = end;
-  let tokens = entries[end].tokens;
-  let card = buildCard(spanText(start, end), liveText(start, end), spanObjs(start, end));
-  if (!card.ok) return null;
-
-  while (start > first) {
-    const prev = start - 1;
-    if (isCardEntry(entries[prev]) || entries[prev].role === "user") break;
-    const nextTokens = tokens + entries[prev].tokens;
-    if (nextTokens > CHUNK_MAX) break;
-    const trial = buildCard(spanText(prev, end), liveText(prev, end), spanObjs(prev, end));
-    if (!trial.ok) break;
-    tokens = nextTokens;
-    start = prev;
-    card = trial;
+  if (picked.pointerOnly) {
+    const resultAt = picked.end;
+    const callId = entries[resultAt].toolResultFor;
+    if (!callId) return null;
+    const pairStart = entries.findIndex((entry) => entry.toolCalls.includes(callId));
+    if (pairStart < 0 || pairStart > resultAt) return null;
+    if (!pointerSpanAllowed(items, pairStart, resultAt, engine)) return null;
+    if (items[pairStart].balancedBefore === false) return null;
+    // Port-side guard (PORTING.md): replacing the call entry also drops any
+    // sibling call in it; a sibling whose result lands outside the span
+    // would be orphaned, so refuse the cut in that case.
+    const resultIndex = new Map<string, number>();
+    entries.forEach((entry, i) => {
+      if (entry.toolResultFor) resultIndex.set(entry.toolResultFor, i);
+    });
+    for (const sibling of entries[pairStart].toolCalls) {
+      if (sibling === callId) continue;
+      const at = resultIndex.get(sibling);
+      if (at === undefined || at > resultAt) return null;
+    }
+    const text = `${MARK}\n${pointerOnlyText(spanObjs(pairStart, resultAt))}`;
+    const card: Card = {
+      ok: true,
+      verdict: "ok",
+      scope: TRUNK_SCOPE,
+      hardLines: [],
+      hardCount: 0,
+      omittedHard: 0,
+      deferred: 0,
+      missing: [],
+      uncovered: "",
+      keptChars: text.length,
+      needsBackup: false,
+      text,
+    };
+    return {
+      start: pairStart,
+      end: resultAt,
+      tokens: sumTokens(pairStart, resultAt),
+      after: afterOf(resultAt),
+      keptTokens,
+      card,
+      pointerOnly: true,
+    };
   }
 
-  while (start <= end && (isCardEntry(entries[start]) || !balancedBefore(entries, start))) {
-    tokens -= entries[start].tokens;
-    start += 1;
-  }
-  if (start > end || tokens < CHUNK_MIN || isCardEntry(entries[start])) return null;
-
-  card = buildCard(spanText(start, end), liveText(start, end), spanObjs(start, end));
+  const start = picked.start;
+  const finalEnd = picked.end;
+  if (isCardEntry(entries[start])) return null;
+  const card = buildCard(spanText(start, finalEnd), liveText(start, finalEnd), spanObjs(start, finalEnd));
   if (!card.ok) return null;
-  if (!balancedAfter(entries, start, end)) return null;
-
-  let after = 0;
-  for (let i = end + 1; i < entries.length; i += 1) after += entries[i].tokens;
-  return { start, end, tokens, after, keptTokens, card };
+  if (!balancedAfter(entries, start, finalEnd)) return null;
+  return {
+    start,
+    end: finalEnd,
+    tokens: sumTokens(start, finalEnd),
+    after: afterOf(finalEnd),
+    keptTokens,
+    card,
+  };
 }

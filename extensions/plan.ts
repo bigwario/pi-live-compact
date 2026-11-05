@@ -1,8 +1,7 @@
-// Card builder ported from dsh-live-compact 1.0.6 plan.js (MIT, MerkyorLynn).
-// Semantics follow the upstream file function by function; host plumbing is
-// adapted to Pi in select.ts / live-compact.ts. See PORTING.md.
-
-import { createHash } from "node:crypto";
+// Card builder and cut planning ported from dsh-live-compact 1.0.8 plan.js
+// (MIT, MerkyorLynn). Semantics follow the upstream file function by
+// function; host plumbing is adapted to Pi in select.ts / live-compact.ts.
+// See PORTING.md.
 
 export const MARK = "Spine extract.";
 const KEEP_BUDGET = 8000;
@@ -43,7 +42,9 @@ export interface CardSpan {
   toolCallId?: string;
   turn?: number | null;
   backgroundStart?: boolean;
-  entryId?: string;
+  seq?: number;
+  callSeq?: number;
+  pointer?: string;
   known?: boolean;
   inCut?: boolean;
 }
@@ -280,6 +281,8 @@ export function callCommand(name: string, raw: unknown): string {
   const args = parseToolArguments(raw);
   const command = (args.command || args.cmd || "") as string;
   if (command) return String(command).split("\n")[0].trim().slice(0, 80);
+  const path = String(args.file_path || args.path || args.filePath || "");
+  if (path) return path.slice(0, 80);
   return String(name || "").slice(0, 80);
 }
 
@@ -399,6 +402,255 @@ export function chooseKeptSpan(
   return { start: rounds[oldest].start, end: newest.end };
 }
 
+// ---- engine resolution: cloud vs local (upstream 1.0.7) ----
+
+export function hostOf(baseURL: string): string {
+  const raw = String(baseURL || "").trim();
+  if (!raw) return "";
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+    return new URL(withScheme).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function ipv4Parts(host: string): number[] | null {
+  const parts = host.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+  return parts;
+}
+
+function ipv4Mapped(host: string): string {
+  const dotted = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (dotted) return dotted[1];
+  const hex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (!hex) return "";
+  const hi = Number.parseInt(hex[1], 16);
+  const lo = Number.parseInt(hex[2], 16);
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
+function isLocalIPv6(host: string): boolean {
+  const mapped = ipv4Mapped(host);
+  if (mapped) return isLocalHost(mapped);
+  const first = Number.parseInt(host.split(":")[0] || "0", 16);
+  if (!Number.isFinite(first)) return false;
+  if ((first & 0xfe00) === 0xfc00) return true;
+  if ((first & 0xffc0) === 0xfe80) return true;
+  return false;
+}
+
+export function isLocalHost(host: string): boolean {
+  const name = String(host || "").toLowerCase();
+  if (!name || name === "localhost" || name.endsWith(".local") || name === "::1") return true;
+  if (name.includes(":")) return isLocalIPv6(name);
+  const parts = ipv4Parts(name);
+  if (!parts) return false;
+  const [a, b] = parts;
+  if (a === 127 || a === 10) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+export interface ProviderListing {
+  provider?: string;
+  id?: string;
+  defaultBaseURL?: string;
+  baseURL?: string;
+}
+
+export function lookupProviderURL(provider: string, listed: ProviderListing[]): string {
+  const name = String(provider || "");
+  if (!name) return "";
+  const match = (listed || []).find((entry) => entry?.provider === name || entry?.id === name);
+  return match?.defaultBaseURL || match?.baseURL || "";
+}
+
+export function fallbackProviderURL(provider: string): string {
+  if (/^(?:deepseek-official|deepseek)$/i.test(String(provider || ""))) return "https://api.deepseek.com/anthropic";
+  return "";
+}
+
+export interface EngineResolution {
+  engine: string;
+  source: string;
+}
+
+export function resolveEngine(
+  input: { provider?: string; baseURL?: string; env?: Record<string, string | undefined> } = {},
+): EngineResolution {
+  const env = input.env ?? (typeof process !== "undefined" ? process.env : {});
+  const override = String(env.SPINE_ENGINE || "").trim().toLowerCase();
+  if (override === "local" || override === "cloud") return { engine: override, source: "env" };
+  if (/strata/i.test(String(input.provider || ""))) return { engine: "local", source: "provider" };
+  const host = hostOf(input.baseURL || "");
+  if (!host) return { engine: "local", source: "unknown" };
+  if (isLocalHost(host)) return { engine: "local", source: "address" };
+  return { engine: "cloud", source: "address" };
+}
+
+// ---- cut selection over typed items (upstream 1.0.8 selectCutIndexes) ----
+
+export interface CutItem {
+  type: string; // user | assistant | tool | system | other
+  tokens: number;
+  checkpoint?: boolean;
+  balancedBefore?: boolean;
+  balancedAfter?: boolean;
+}
+
+export interface CutPick {
+  start: number;
+  end: number;
+  tokens: number;
+  gain: number;
+  pointerOnly?: boolean;
+}
+
+function nonUserGain(items: CutItem[], start: number, end: number): number {
+  let gain = 0;
+  for (let index = start; index <= end; index += 1) {
+    if (items[index].type !== "user" && items[index].type !== "system") gain += items[index].tokens || 0;
+  }
+  return gain;
+}
+
+function walkOffTail(items: CutItem[], end: number): number {
+  while (end >= 0) {
+    const item = items[end];
+    const shortUser = item.type === "user" && (item.tokens || 0) < 400;
+    if (item.type !== "assistant" && !shortUser && !item.checkpoint) break;
+    end -= 1;
+  }
+  while (end >= 0 && items[end].type === "user") end -= 1;
+  while (end >= 0 && items[end].checkpoint) end -= 1;
+  return end;
+}
+
+function expandBack(
+  items: CutItem[],
+  end: number,
+  stopAt: number,
+  opts: { crossUser: boolean; chunkMax: number },
+): { start: number; end: number; tokens: number; gain: number } {
+  let start = end;
+  let tokens = items[end].tokens || 0;
+  while (start > stopAt) {
+    const prev = start - 1;
+    if (items[prev].checkpoint) break;
+    if (!opts.crossUser && items[prev].type === "user") break;
+    if (tokens + (items[prev].tokens || 0) > opts.chunkMax) break;
+    start = prev;
+    tokens += items[prev].tokens || 0;
+  }
+  return { start, end, tokens, gain: nonUserGain(items, start, end) };
+}
+
+function balancedPick(items: CutItem[], start: number, end: number): boolean {
+  if (items[end].balancedAfter === false) return false;
+  if (items[start].balancedBefore === false) return false;
+  return true;
+}
+
+export interface SelectCutOptions {
+  engine?: string;
+  chunkMin?: number;
+  chunkMax?: number;
+  pointerMax?: number;
+  maxEnd?: number | null;
+  totalTokens?: number;
+  drain?: boolean;
+  urgentTokens?: number;
+  keepBudget?: number;
+}
+
+export function selectCutIndexes(items: CutItem[], opts: SelectCutOptions = {}): CutPick | null {
+  const engine = opts.engine ?? "cloud";
+  const chunkMin = opts.chunkMin ?? 1000;
+  const chunkMax = opts.chunkMax ?? 32000;
+  const pointerMax = opts.pointerMax ?? chunkMax;
+  const drain = opts.drain ?? false;
+  const urgentTokens = opts.urgentTokens ?? 48000;
+  const keepBudget = opts.keepBudget ?? 32000;
+  const totalTokens = opts.totalTokens;
+  const maxEnd = opts.maxEnd ?? null;
+  if (!items?.length) return null;
+  const cloud = engine !== "local";
+  const draining = cloud && (drain || (typeof totalTokens === "number" && totalTokens >= urgentTokens));
+  if (!drain && cloud && typeof totalTokens === "number" && totalTokens <= keepBudget) return null;
+  const limit = draining ? items.length - 1 : (maxEnd === null ? items.length - 1 : maxEnd);
+  if (limit < 0) return null;
+  const lastUser = items.reduce((found, item, index) => (item.type === "user" ? index : found), -1);
+  const firstUser = items.findIndex((item) => item.type === "user");
+  const floor = firstUser >= 0 ? firstUser + 1 : 0;
+  const oversized: number[] = [];
+  for (let index = limit; index >= 0; index -= 1) {
+    if (items[index].type !== "tool" || (items[index].tokens || 0) <= pointerMax) continue;
+    if (!cloud && lastUser >= 0 && index <= lastUser) continue;
+    oversized.push(index);
+  }
+  const pointer: CutPick | null = oversized.length ? { start: oversized[0], end: oversized[0], tokens: items[oversized[0]].tokens || 0, pointerOnly: true, gain: 0 } : null;
+  if (cloud && !draining) return pointer;
+  const end = walkOffTail(items, limit);
+  if (end < 0) return pointer;
+  if (!cloud) {
+    if (lastUser >= 0 && end <= lastUser) return pointer;
+    if ((items[end].tokens || 0) > pointerMax && items[end].type === "tool") return { start: end, end, tokens: items[end].tokens || 0, pointerOnly: true, gain: 0 };
+    if ((items[end].tokens || 0) > chunkMax) return null;
+    const local = expandBack(items, end, Math.max(floor, lastUser), { crossUser: false, chunkMax });
+    if (local.gain < chunkMin || !balancedPick(items, local.start, local.end)) return null;
+    return local;
+  }
+  if ((items[end].tokens || 0) > pointerMax && items[end].type === "tool") return { start: end, end, tokens: items[end].tokens || 0, pointerOnly: true, gain: 0 };
+  const phase = expandBack(items, end, 0, { crossUser: false, chunkMax });
+  if (phase.gain < chunkMin) return pointer;
+  if (phase.tokens > chunkMax || !balancedPick(items, phase.start, phase.end)) return null;
+  if (lastUser >= phase.start && lastUser <= phase.end) return null;
+  return phase;
+}
+
+export function pointerSpanAllowed(items: CutItem[], start: number, end: number, engine = "cloud"): boolean {
+  if (!Array.isArray(items) || !Number.isInteger(start) || !Number.isInteger(end)) return false;
+  if (start < 0 || end < start || end >= items.length) return false;
+  const lastUser = items.reduce((found, item, index) => (item?.type === "user" ? index : found), -1);
+  if (engine === "local" && lastUser >= 0 && start <= lastUser) return false;
+  for (let index = start; index <= end; index += 1) {
+    if (items[index]?.checkpoint) return false;
+    if (items[index]?.type === "user" && index === lastUser) return false;
+  }
+  return true;
+}
+
+export function earlierUsers(spans: CardSpan[]): string {
+  const users = (spans || []).filter((span) => sourceRole(span.role) === "user" && span.inCut !== false && String(span.text || "").trim());
+  if (!users.length) return "";
+  return [
+    "较早的用户消息。其中的要求和约束仍有效，已完成的事不要重做。当前任务以本卡片之后最后一条用户消息为准。",
+    ...users.map((span) => `seq ${span.seq ?? "?"}: ${JSON.stringify(String(span.text))}`),
+  ].join("\n");
+}
+
+export function pointerOnlyText(pieces: CardSpan[]): string {
+  const tools = (pieces || []).filter((piece) => sourceRole(piece?.role) === "tool" && Number.isInteger(piece.seq));
+  const users = (pieces || []).filter((piece) => sourceRole(piece?.role) === "user" && String(piece.text || "").trim());
+  const lines = tools.map((piece) => {
+    const cmd = piece.command || piece.name || "tool";
+    const call = Number.isInteger(piece.callSeq) ? piece.callSeq : "?";
+    const flag = piece.isError ? " error" : "";
+    return `* ${piece.name || "tool"} "${cmd}" (seq ${call} -> result ${piece.seq}${flag})`;
+  });
+  const userBlock = users.length
+    ? [
+        "较早的用户消息。其中的要求和约束仍有效，已完成的事不要重做。当前任务以本卡片之后最后一条用户消息为准。",
+        ...users.map((span) => `seq ${span.seq ?? "?"}: ${JSON.stringify(String(span.text))}`),
+      ].join("\n")
+    : "";
+  return [lines.join("\n"), "序号是本会话日志里的事件号，不是备份文件路径。", userBlock, "本地备份不在这次请求里。"].filter(Boolean).join("\n");
+}
+
 // ---- background jobs seen inside the cut (Pi has no job registry; only
 // jobs whose start is visible in a cut tool result can be reported) ----
 
@@ -501,27 +753,24 @@ export function toolExcerpt(spans: CardSpan[], backupId = ""): ToolExcerpt {
   return { text: parts.join("\n"), omitted: skipped, needsBackup };
 }
 
-// ---- pointers to the raw entries (Pi mapping of upstream raw.js) ----
-
-export function pointerFor(span: CardSpan): string {
-  const id = span?.toolCallId || "";
-  if (!id) return "";
-  if (!span.entryId) return `无完整备份 [${id}]`;
-  const text = String(span.text || "");
-  const bytes = Buffer.byteLength(text, "utf8");
-  const sha = createHash("sha256").update(text, "utf8").digest("hex").slice(0, 12);
-  const label = readResultLabel(span.name || "", span.filePath || "", span.turn);
-  return `${label ? `${label} ` : ""}原文 session entry ${span.entryId} sha256:${sha} ${bytes}字节 [${id}]`;
-}
+// ---- pointers to the raw entries: session-log sequence numbers
+// (upstream 1.0.7 replaced backup file paths with seq pointers) ----
 
 function pointerLines(spans: CardSpan[]): string[] {
   const lines: string[] = [];
   for (const span of spans || []) {
-    if (sourceRole(span.role) !== "tool" || !span.toolCallId || span.inCut === false) continue;
-    const line = pointerFor(span);
-    if (line) lines.push(line);
+    if (sourceRole(span.role) !== "tool" || span.inCut === false) continue;
+    if (Number.isInteger(span.seq)) {
+      const cmd = span.command || span.name || "tool";
+      const call = Number.isInteger(span.callSeq) ? span.callSeq : "?";
+      const flag = span.isError ? " error" : "";
+      lines.push(`* ${span.name || "tool"} "${cmd}" (seq ${call} -> result ${span.seq}${flag})`);
+      continue;
+    }
+    if (span.toolCallId) lines.push(`无完整备份 [${span.toolCallId}]`);
+    else if (span.pointer && !String(span.pointer).includes("/")) lines.push(span.pointer);
   }
-  return lines;
+  return lines.filter(Boolean);
 }
 
 // ---- the card ----
@@ -552,7 +801,6 @@ export interface Card {
   uncovered: string;
   keptChars: number;
   needsBackup: boolean;
-  entryIds: string[];
   text: string;
 }
 
@@ -616,6 +864,8 @@ export function buildCard(spanText: string, liveText = "", spans: CardSpan[] | n
     ...(jobs.length === 0 ? ["- (none)"] : jobs.map((line) => `- ${line}`)),
     "原文指针:",
     ...(pointers.length === 0 ? ["- (none)"] : pointers.map((line) => `- ${line}`)),
+    "序号是本会话日志里的事件号，不是备份文件路径。",
+    earlierUsers(claims || []),
     "本地备份不在这次请求里。",
     tools.text,
   ].filter(Boolean).join("\n");
@@ -631,11 +881,6 @@ export function buildCard(spanText: string, liveText = "", spans: CardSpan[] | n
     uncovered: split.uncovered,
     keptChars: used,
     needsBackup: tools.needsBackup,
-    entryIds: (claims || []).flatMap((span) => (span.entryId ? [span.entryId] : [])),
     text,
   };
-}
-
-export function backupHint(): string {
-  return "省略的工具原文在本会话文件的原始条目里（见原文指针）。需要这条原文再读，不要默认读进来。";
 }

@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.0.6, and the host-mechanism differences are
+card algorithm match upstream 1.0.8, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,10 +21,18 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Card semantics at 1.0.6 (synced with upstream):
+Semantics at 1.0.8 (synced with upstream):
 
+- **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
+  loopback / LAN / Tailscale-range address, counts as **local** (cuts as
+  before, always after the last user message). Anything else is **cloud**:
+  below the keep budget (32K) regular spans are left alone and only oversized
+  tool results are pointerised; once the total plus predicted next-turn
+  growth passes the budget, draining starts — turn segments are cut one by
+  one until the total is back under budget. `SPINE_ENGINE=local|cloud`
+  forces the mode.
 - **The newest 3 finished tool rounds stay verbatim** (within a combined
-  32K-token budget); the cut must end before they start.
+  32K-token budget); outside a drain, the cut must end before they start.
 - Hard lines are claimed only from non-assistant messages, and kept lines are
   tagged with their original role. Completion claims in assistant prose do not
   count as hard lines; tool evidence records only the turn, the command, the
@@ -33,12 +41,18 @@ Card semantics at 1.0.6 (synced with upstream):
   Failed tool results are excerpted first, and failure is recognised only from
   structural signals (non-zero exit codes, `isError`, `[stderr]` markers) —
   never from keywords.
-- Every cut tool result leaves a pointer on the card: session entry id +
-  sha256 + byte count, so the original can be re-read when needed.
+- **Oversized tool results** (a single result over 32K tokens, adjustable)
+  are not excerpted at all: the whole round is replaced by a pointer card
+  that records only "call at sequence N → result at sequence M".
+- Every cut tool result leaves a **sequence pointer** on the card (its event
+  number in the session log; the card states explicitly that it is not a
+  backup file path). Earlier user messages inside a cut span are preserved
+  verbatim as JSON lines — their requirements and constraints stay in force.
 
 One natural improvement over upstream: Pi session files are append-only and
 the cut entries stay on record, so upstream's append-only plaintext shadow
-directory is unnecessary — pointers reference the session entries directly.
+directory is unnecessary — sequence pointers reference the session entries
+directly.
 
 ## Installation
 
@@ -64,17 +78,26 @@ Same names and meanings as upstream:
 |---|---|---|
 | `SPINE_MIN_TOKENS` | `20000` | Total-context threshold that triggers a small cut |
 | `SPINE_KEEP_ROUNDS` | `3` | Newest finished tool rounds kept verbatim before the cut |
-| `SPINE_KEEP_ROUND_TOKENS` | `32000` | Combined token budget for the kept rounds |
+| `SPINE_KEEP_ROUND_TOKENS` | `32000` | Combined token budget for the kept rounds (also the cloud drain target) |
+| `SPINE_ENGINE` | resolved from endpoint | Force the mode: `local` or `cloud` |
+| `SPINE_POINTER_TOKENS` | `32000` | A single tool result above this is pointerised, not excerpted |
+| `SPINE_CHUNK_MIN` | `1000` | Minimum gain (non-user tokens) for one cut |
+| `SPINE_CHUNK_MAX` | `32000` | Maximum tokens per cut |
 
-The remaining constants match upstream's hard-coded values: 1K–32K tokens
-per cut, an 8,000-character keep budget, 2,200 tokens of tail protection, no
-urgent cuts below 48K, and spans above 650K are out of the small cuts' scope
+`SPINE_CHUNK_MIN` / `SPINE_CHUNK_MAX` are hard-coded constants upstream;
+upstream issue #15 proposes turning them into environment variables with
+unchanged defaults, and the Pi port adopts that suggestion early
+(see PORTING.md #18).
+
+The remaining constants match upstream's hard-coded values: an
+8,000-character keep budget, 2,200 tokens of tail protection, no urgent cuts
+below 48K, and spans above 650K are out of the small cuts' scope
 (see PORTING.md #7).
 
 ## Tests
 
 ```sh
-npm test   # node --test, 17 cases covering the card builder and span selection
+npm test   # node --test, 33 cases covering the card builder, engine resolution and span selection
 ```
 
 ## License and origin

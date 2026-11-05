@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.6
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.8
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -8,16 +8,30 @@
 // is replaced by the card, the rest are omitted, and the raw entries stay in
 // the session file (so Pi needs no shadow directory — see PORTING.md).
 //
+// 1.0.7/1.0.8 behaviour carried over: selection splits by engine (local
+// endpoints cut like the original; cloud endpoints only pointerise
+// oversized results until the total plus predicted growth passes the keep
+// budget, then drain turn-segment by turn-segment), and upstream's
+// multi-pass drain is folded into one turn_end by selecting against a
+// simulated entry list and returning every pass's edits together.
+//
 // No model is called and no tool is added, exactly like the original's
 // spine cuts. When the card gate refuses (prose-heavy span), nothing is cut
 // and Pi's own compaction remains in charge, mirroring the original's
 // "wait-80" route.
 
-import { backgroundJobId, backupHint, callCommand, callFilePath, estimateTokens } from "./plan.ts";
-import { selectNewestChunk, type CallInfo, type SpanEntry } from "./select.ts";
+import {
+  backgroundJobId,
+  callCommand,
+  callFilePath,
+  estimateTokens,
+  fallbackProviderURL,
+  lookupProviderURL,
+  resolveEngine,
+} from "./plan.ts";
+import { KEEP_ROUND_TOKENS, selectNewestChunk, URGENT_TOKENS, type CallInfo, type SpanEntry } from "./select.ts";
 
 const BIG_GATE = 650000;
-const URGENT_TOKENS = 48000;
 const MAX_TAIL = 2200;
 const MIN_PRESSURE = Number(process.env.SPINE_MIN_TOKENS || 20000);
 
@@ -72,38 +86,97 @@ function toSpanEntries(projected: any[]): SpanEntry[] {
       turn,
       call: toolResultFor ? callIndex.get(toolResultFor) || null : null,
       backgroundStart: toolResultFor ? Boolean(backgroundJobId(text)) : false,
+      seq: entries.length,
     });
   }
   return entries;
 }
 
+// Engine identity from the session's model: provider name and base URL,
+// with the registry as the lookup table, mirroring the host wiring in
+// upstream index.js (requestHeader / requestContext / listProviders).
+function engineFor(ctx: any): { engine: string; source: string } {
+  let provider = "";
+  let baseURL = "";
+  try {
+    provider = typeof ctx?.model?.provider === "string" ? ctx.model.provider : "";
+    baseURL = typeof ctx?.model?.baseUrl === "string" ? ctx.model.baseUrl : "";
+    if (!baseURL && provider) {
+      const listed = (ctx?.modelRegistry?.getAll?.() || []).map((model: any) => ({
+        provider: typeof model?.provider === "string" ? model.provider : "",
+        id: typeof model?.provider === "string" ? model.provider : "",
+        baseURL: typeof model?.baseUrl === "string" ? model.baseUrl : "",
+      }));
+      baseURL = lookupProviderURL(provider, listed);
+    }
+  } catch {
+    // Resolution must never break a turn; fall through to the fallback.
+  }
+  if (!baseURL) baseURL = fallbackProviderURL(provider);
+  return resolveEngine({ provider, baseURL, env: process.env });
+}
+
 export default function liveCompact(pi: any) {
+  // Turn-growth bookkeeping for the cloud drain trigger. Pi runs one
+  // process per invocation, so this resets between `pi -p` runs; the
+  // urgent-line trigger inside selection does not depend on it.
+  let turnBase: number | null = null;
+  let maxTurnGrowth = 0;
+
   pi.on("turn_end", async (event: any, ctx: any) => {
     const usage = ctx.getContextUsage?.();
     const projected = event.context?.contextEntries ?? [];
-    const entries = toSpanEntries(projected);
-    const total = typeof usage?.tokens === "number" ? usage.tokens : entries.reduce((sum, e) => sum + e.tokens, 0);
-    if (total < MIN_PRESSURE || total >= BIG_GATE) return;
+    let work = toSpanEntries(projected);
+    const hostTotal = typeof usage?.tokens === "number" ? usage.tokens : work.reduce((sum, e) => sum + e.tokens, 0);
+    if (hostTotal < MIN_PRESSURE || hostTotal >= BIG_GATE) return;
 
-    const chunk = selectNewestChunk(entries);
-    if (!chunk) return;
-    const tailBeyondKept = chunk.after - (chunk.keptTokens || 0);
-    if (tailBeyondKept > MAX_TAIL && total < URGENT_TOKENS) return;
+    const { engine } = engineFor(ctx);
+    const cloud = engine !== "local";
+    const growth = Math.max(0, hostTotal - (turnBase ?? hostTotal));
+    maxTurnGrowth = Math.max(maxTurnGrowth, growth);
+    const drain = cloud && hostTotal + maxTurnGrowth > KEEP_ROUND_TOKENS;
 
-    const span = entries.slice(chunk.start, chunk.end + 1);
-    const cardText =
-      `${chunk.card.text}\n` +
-      (chunk.card.needsBackup ? `${backupHint()}\n` : "") +
-      `整段原文：本会话条目 ${span[0].id}..${span[span.length - 1].id}（原始条目保留在会话文件里）。`;
-    if (estimateTokens(cardText) >= chunk.tokens) return;
-
-    const started = Date.now();
-    const drafts = span.map((entry, i) =>
-      i === 0
-        ? { type: "context_edit", targetId: entry.id, replacement: { content: [{ type: "text", text: cardText }] } }
-        : { type: "context_edit", targetId: entry.id, replacement: null },
-    );
-    ctx.ui?.notify?.(`spine cut ${Date.now() - started}ms total=${total} chunk=${chunk.tokens}`, "info");
+    let simTotal = hostTotal;
+    const drafts: any[] = [];
+    let cuts = 0;
+    for (let pass = 0; pass < 8; pass += 1) {
+      if (drain && simTotal <= KEEP_ROUND_TOKENS) break;
+      const chunk = selectNewestChunk(work, { engine, totalTokens: simTotal, drain });
+      if (!chunk) break;
+      const tailBeyondKept = chunk.after - (chunk.keptTokens || 0);
+      if (!drain && tailBeyondKept > MAX_TAIL && simTotal < URGENT_TOKENS) break;
+      const span = work.slice(chunk.start, chunk.end + 1);
+      const cardText = chunk.card.text;
+      const cardTokens = estimateTokens(cardText);
+      if (cardTokens >= chunk.tokens) break;
+      for (let i = 0; i < span.length; i += 1) {
+        drafts.push(
+          i === 0
+            ? { type: "context_edit", targetId: span[i].id, replacement: { content: [{ type: "text", text: cardText }] } }
+            : { type: "context_edit", targetId: span[i].id, replacement: null },
+        );
+      }
+      const cardEntry: SpanEntry = {
+        id: span[0].id,
+        role: "assistant",
+        text: cardText,
+        tokens: cardTokens,
+        toolCalls: [],
+        toolResultFor: null,
+        isError: false,
+        turn: span[0].turn ?? null,
+        call: null,
+        backgroundStart: false,
+        seq: span[0].seq,
+      };
+      work = [...work.slice(0, chunk.start), cardEntry, ...work.slice(chunk.end + 1)];
+      simTotal -= chunk.tokens - cardTokens;
+      cuts += 1;
+      if (!drain) break;
+    }
+    turnBase = simTotal;
+    if (cuts === 0) return;
+    ctx.ui?.notify?.(`spine cut x${cuts} total=${hostTotal} -> ${simTotal}`, "info");
     return { entries: drafts };
   });
 }
