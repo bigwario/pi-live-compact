@@ -15,10 +15,16 @@
 // multi-pass drain is folded into one turn_end by selecting against a
 // simulated entry list and returning every pass's edits together.
 //
-// No model is called and no tool is added, exactly like the original's
+// No model is called for the cuts themselves, exactly like the original's
 // spine cuts. When the card gate refuses (prose-heavy span), nothing is cut
 // and Pi's own compaction remains in charge, mirroring the original's
 // "wait-80" route.
+//
+// One tool IS added, unlike the original: spine_recall hands back the
+// original text of a cut tool result by the entry-id ref printed on the
+// card. Upstream's host covers that need with its shadow store and search
+// API; Pi has neither, so the port keeps a sidecar archive next to the
+// session file and serves it through the tool (PORTING.md #19).
 
 import {
   backgroundJobId,
@@ -29,6 +35,8 @@ import {
   lookupProviderURL,
   resolveEngine,
 } from "./plan.ts";
+import { Type } from "typebox";
+import { RecallStore, recallHint, recallResult, type RecallItem } from "./recall.ts";
 import { KEEP_ROUND_TOKENS, selectNewestChunk, URGENT_TOKENS, type CallInfo, type SpanEntry } from "./select.ts";
 
 const BIG_GATE = 650000;
@@ -123,7 +131,42 @@ export default function liveCompact(pi: any) {
   let turnBase: number | null = null;
   let maxTurnGrowth = 0;
 
+  // Archive of cut tool-result originals, served by spine_recall.
+  const store = new RecallStore();
+  const bindStore = (ctx: any) => {
+    try {
+      store.bind(ctx?.sessionManager?.getSessionFile?.());
+    } catch {
+      // Archive binding must never break a turn.
+    }
+  };
+  pi.on("session_start", async (_event: any, ctx: any) => {
+    bindStore(ctx);
+  });
+  pi.registerTool({
+    name: "spine_recall",
+    label: "Spine Recall",
+    description:
+      "取回被 Spine 卡片切掉的工具原文存档。卡片上的指针只剩摘录；需要确切原文时，用卡片「原文存档」行给出的 ref（条目 id）调用本工具，不要为了拿回被切内容而重新读取源文件。Retrieves the archived original tool output that a Spine extract card replaced, by the entry-id ref printed on the card.",
+    promptSnippet: "spine_recall: get back tool output a Spine card cut, by the ref on the card",
+    promptGuidelines: [
+      "When a Spine extract card cut tool output you still need, call spine_recall with the ref printed on the card instead of re-reading the source file.",
+    ],
+    parameters: Type.Object({
+      ref: Type.String({ description: "The entry id printed on the Spine card's 原文存档 line" }),
+      toFile: Type.Optional(
+        Type.Boolean({ description: "Write the original to a file and return its path instead of returning it inline" }),
+      ),
+    }),
+    async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
+      bindStore(ctx);
+      const result = recallResult(store, String(params?.ref ?? ""), params?.toFile === true);
+      return { content: [{ type: "text" as const, text: result.text }], details: { found: result.found } };
+    },
+  });
+
   pi.on("turn_end", async (event: any, ctx: any) => {
+    bindStore(ctx);
     const usage = ctx.getContextUsage?.();
     const projected = event.context?.contextEntries ?? [];
     let work = toSpanEntries(projected);
@@ -146,9 +189,25 @@ export default function liveCompact(pi: any) {
       const tailBeyondKept = chunk.after - (chunk.keptTokens || 0);
       if (!drain && tailBeyondKept > MAX_TAIL && simTotal < URGENT_TOKENS) break;
       const span = work.slice(chunk.start, chunk.end + 1);
-      const cardText = chunk.card.text;
+      let cardText = chunk.card.text;
+      // Archive the span's largest tool results and name their recall
+      // refs on the card, so cut content stays reachable by tool call
+      // instead of by re-reading the source (PORTING #19).
+      const recallItems: RecallItem[] = span
+        .filter((entry) => entry.role === "toolResult" && entry.text.length > 0)
+        .sort((a, b) => b.text.length - a.text.length)
+        .slice(0, 3)
+        .map((entry) => ({
+          id: entry.id,
+          label: entry.call
+            ? `${entry.call.name}${entry.call.command ? ` "${entry.call.command}"` : ""}`
+            : "tool",
+          text: entry.text,
+        }));
+      if (recallItems.length > 0) cardText += `\n${recallHint(recallItems)}`;
       const cardTokens = estimateTokens(cardText);
       if (cardTokens >= chunk.tokens) break;
+      for (const item of recallItems) store.put(item);
       for (let i = 0; i < span.length; i += 1) {
         drafts.push(
           i === 0

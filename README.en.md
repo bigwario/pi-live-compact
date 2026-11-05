@@ -48,6 +48,12 @@ Semantics at 1.0.8 (synced with upstream):
   number in the session log; the card states explicitly that it is not a
   backup file path). Earlier user messages inside a cut span are preserved
   verbatim as JSON lines — their requirements and constraints stay in force.
+- **Cut originals stay retrievable**: the extension registers one extra tool,
+  `spine_recall`. When a span is cut, its largest tool originals are archived
+  to a sidecar file next to the session, and the card's archive line prints
+  the recall ref (the entry id). A model that still needs the original calls
+  the tool instead of re-reading the source file. (Upstream covers this with
+  the host's shadow search; Pi has none, so the port supplies the tool.)
 
 One natural improvement over upstream: Pi session files are append-only and
 the cut entries stay on record, so upstream's append-only plaintext shadow
@@ -97,7 +103,7 @@ below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 33 cases covering the card builder, engine resolution and span selection
+npm test   # node --test, 40 cases covering the card builder, engine resolution, span selection and the recall archive
 ```
 
 ## License and origin
