@@ -23,6 +23,6 @@
 | 16 | 指针卡的头 | 指针卡正文无 MARK，靠 source kind `spine-checkpoint` 识别 | 指针卡首行加 `Spine extract.` | Pi 没有 source kind，卡片身份只能靠文本标记（见 #6），否则下一轮选段认不出它、会把指针卡再切一遍 |
 | 17 | 指针刀的多调用守护 | 宿主 commitSelectedSpan 整段替换 | 若承载调用的那条 assistant 消息里还有别的调用、且其结果落在 span 之外，拒绝这一刀 | Pi 的 context_edit 是整条替换：把那条消息换成指针卡会让 span 外的结果变孤儿。原版 surface 语义没有这个坑，Pi 侧多加一道守护 |
 | 18 | CHUNK_MIN/CHUNK_MAX | 写死常量（1000 / 32000） | 提前采纳上游 issue #15 的建议：`SPINE_CHUNK_MIN` / `SPINE_CHUNK_MAX` 两个环境变量，默认与原版相同，并钳制 MIN ≤ MAX | issue #11 实测慢增长会话（一轮一个小工具调用）会被写死的 1000 下限整段挡死；给 Pi 侧留一个可调口子，默认行为与原版一字不差 |
-| 19 | 与其他扩展共存 | —（原版宿主内无此问题） | 2026-11-05 实测：与 billion-context 同时启用时，它中途注入的 toolsAdded 系统条目会让 Pi 对该 turn 的边界编辑报 `does not contribute editable model content`，当轮 context_edit 一条都没落盘；单独启用本扩展（`--no-extensions`）时一切正常 | 冲突点在宿主的编辑校验与对方的注入条目，不在本扩展的草案内容；如实记录现象，是否协调由使用者决定 |
+| 19 | 与 billion-context 的关系 | —（原版宿主内无此问题） | 两者是同层的压缩引擎，本就互斥，不要同时启用：2026-11-05 实测同启时 Pi 会拒收当轮的 context_edit（对方注入的 toolsAdded 系统条目过不了边界校验）。单独启用本扩展一切正常 | 这不是兼容性缺陷，是定位使然——日常用 billion 主力时本扩展不装载 |
 
 已知未覆盖：DSH 原版的 `SPINE_SHADOW_DIR`、`DSH_HOME` 环境变量在 Pi 版无对应物（见 #13）。
