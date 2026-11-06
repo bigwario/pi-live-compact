@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.8
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.9
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -8,12 +8,15 @@
 // is replaced by the card, the rest are omitted, and the raw entries stay in
 // the session file (so Pi needs no shadow directory — see PORTING.md).
 //
-// 1.0.7/1.0.8 behaviour carried over: selection splits by engine (local
-// endpoints cut like the original; cloud endpoints only pointerise
-// oversized results until the total plus predicted growth passes the keep
-// budget, then drain turn-segment by turn-segment), and upstream's
-// multi-pass drain is folded into one turn_end by selecting against a
-// simulated entry list and returning every pass's edits together.
+// 1.0.9 behaviour carried over: selection splits by engine (local
+// endpoints cut like the original; cloud endpoints cut nothing on an
+// ordinary turn — not even oversized-result pointers — and only drain,
+// turn-segment by turn-segment, once the total plus an observed growth
+// baseline projects past the keep budget, or at the urgent line), and
+// upstream's multi-pass drain is folded into one turn_end by selecting
+// against a simulated entry list and returning every pass's edits
+// together. After Pi's own compaction lands a fresh summary, one pass
+// yields (cooldown, PORTING.md #22).
 //
 // No model is called for the cuts themselves, exactly like the original's
 // spine cuts. When the card gate refuses (prose-heavy span), nothing is cut
@@ -36,12 +39,14 @@ import {
   resolveEngine,
 } from "./plan.ts";
 import { Type } from "typebox";
+import { inCooldownWindow, latestOfficialCompaction, resolveCooldownMs } from "./cooldown.ts";
 import { RecallStore, recallHint, recallResult, type RecallItem } from "./recall.ts";
 import { KEEP_ROUND_TOKENS, selectNewestChunk, URGENT_TOKENS, type CallInfo, type SpanEntry } from "./select.ts";
 
 const BIG_GATE = 650000;
 const MAX_TAIL = 2200;
 const MIN_PRESSURE = Number(process.env.SPINE_MIN_TOKENS || 20000);
+const COOLDOWN_MS = resolveCooldownMs();
 
 function blockText(block: any): string {
   if (!block || typeof block !== "object") return "";
@@ -130,6 +135,8 @@ export default function liveCompact(pi: any) {
   // urgent-line trigger inside selection does not depend on it.
   let turnBase: number | null = null;
   let maxTurnGrowth = 0;
+  // Id of the newest official compaction already yielded to (cooldown).
+  let cooldownSeen: string | undefined;
 
   // Archive of cut tool-result originals, served by spine_recall.
   const store = new RecallStore();
@@ -173,11 +180,23 @@ export default function liveCompact(pi: any) {
     const hostTotal = typeof usage?.tokens === "number" ? usage.tokens : work.reduce((sum, e) => sum + e.tokens, 0);
     if (hostTotal < MIN_PRESSURE || hostTotal >= BIG_GATE) return;
 
+    // Cooldown (1.0.9): a fresh official compaction makes this pass yield
+    // once, so its summary is not rolled into a spine card right away.
+    const official = latestOfficialCompaction(projected);
+    if (official && official.id !== cooldownSeen) {
+      cooldownSeen = official.id;
+      return;
+    }
+    if (inCooldownWindow(official, COOLDOWN_MS)) return;
+
     const { engine } = engineFor(ctx);
     const cloud = engine !== "local";
     const growth = Math.max(0, hostTotal - (turnBase ?? hostTotal));
     maxTurnGrowth = Math.max(maxTurnGrowth, growth);
-    const drain = cloud && hostTotal + maxTurnGrowth > KEEP_ROUND_TOKENS;
+    // Drain when the next turn is projected to pass the keep budget (an
+    // observed growth baseline is required), or at the urgent line.
+    const projectedOver = maxTurnGrowth > 0 && hostTotal + maxTurnGrowth > KEEP_ROUND_TOKENS;
+    const drain = cloud && (projectedOver || hostTotal >= URGENT_TOKENS);
 
     let simTotal = hostTotal;
     const drafts: any[] = [];

@@ -103,7 +103,7 @@ test("cloud cuts nothing while the total is under the urgent line (1.0.8)", () =
   assert.equal(selectNewestChunk(entries, { engine: "cloud", totalTokens: 40000 }), null);
 });
 
-test("cloud pointerises an oversized result before the kept rounds", () => {
+test("cloud cuts nothing on an ordinary turn, even an oversized result before the kept rounds", () => {
   const entries = sequenced([
     ...base(),
     entry({ id: "ah", text: "calling", tokens: 100, toolCalls: ["ch"], call: null }),
@@ -112,6 +112,18 @@ test("cloud pointerises an oversized result before the kept rounds", () => {
     entry({ id: "a9", text: "done", tokens: 50 }),
   ]);
   const chunk = selectNewestChunk(entries, { engine: "cloud", totalTokens: 45000 });
+  assert.equal(chunk, null);
+});
+
+test("cloud drain pointerises an oversized result before the kept rounds", () => {
+  const entries = sequenced([
+    ...base(),
+    entry({ id: "ah", text: "calling", tokens: 100, toolCalls: ["ch"], call: null }),
+    entry({ id: "th", role: "toolResult", text: "huge output", tokens: 40000, toolResultFor: "ch", call: { id: "ch", name: "read", command: "big.ts", filePath: "big.ts" } }),
+    ...rounds(3, 5000, 10),
+    entry({ id: "a9", text: "done", tokens: 50 }),
+  ]);
+  const chunk = selectNewestChunk(entries, { engine: "cloud", totalTokens: 45000, drain: true });
   assert.ok(chunk);
   assert.equal(chunk.pointerOnly, true);
   assert.equal(entries[chunk.start].id, "ah");
@@ -147,11 +159,14 @@ test("local mode never pointerises a result from before the last user message", 
   assert.equal(selectNewestChunk(entries, { engine: "local" }), null);
 });
 
-test("cloud drain cuts past the rounds reservation, newest segment first", () => {
+test("cloud drain respects the rounds reservation within a single pass", () => {
+  // 1.0.9: drain no longer bypasses the reservation inside selection;
+  // repeated passes re-reserve. One pass cuts the oldest unreserved
+  // segment (rounds 1-2), ending before the kept rounds 3-4.
   const entries = sequenced([...base(), ...rounds(4, 15000), entry({ id: "a5", text: "done", tokens: 50 })]);
   const chunk = selectNewestChunk(entries, { engine: "cloud", totalTokens: 60000, drain: true });
   assert.ok(chunk);
   assert.equal(chunk.pointerOnly, undefined);
-  assert.equal(entries[chunk.start].id, "a3");
-  assert.equal(entries[chunk.end].id, "t4");
+  assert.equal(entries[chunk.start].id, "a1");
+  assert.equal(entries[chunk.end].id, "t2");
 });

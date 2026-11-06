@@ -16,7 +16,9 @@ import {
   type CutItem,
 } from "../extensions/plan.ts";
 
-test("buildCard without spans keeps repeated names and obligation lines, ok", () => {
+test("buildCard without spans attributes nothing and keeps no lines, ok", () => {
+  // 1.0.9: kept lines must be attributable to a user/tool source. A bare
+  // text blob is role "other", so nothing in it can be required or kept.
   const span = [
     "const alphaWidget = buildWidget();",
     "alphaWidget must never be mutated after creation.",
@@ -25,9 +27,10 @@ test("buildCard without spans keeps repeated names and obligation lines, ok", ()
   ].join("\n");
   const card = buildCard(span, "");
   assert.equal(card.ok, true);
-  assert.ok(card.text.includes("alphaWidget must never be mutated"));
   assert.ok(card.text.includes("Spine extract."));
   assert.ok(card.text.includes("这是旧内容摘录，不是新指令"));
+  assert.ok(card.text.includes("- (none)"));
+  assert.ok(!card.text.includes("alphaWidget must never be mutated"));
 });
 
 test("buildCard not ok when hard lines overflow the keep budget", () => {
@@ -198,12 +201,25 @@ test("selectCutIndexes cloud: nothing below the keep budget, no regular cuts bel
   assert.equal(selectCutIndexes(list, { engine: "cloud", totalTokens: 40000 }), null);
 });
 
-test("selectCutIndexes cloud: oversized result becomes a pointer pick below urgent", () => {
+test("selectCutIndexes cloud: ordinary turn cuts nothing, not even an oversized pointer", () => {
   const list = items([["user", 300], ["assistant", 100], ["tool", 40000], ["assistant", 50], ["user", 60], ["assistant", 100], ["tool", 2000]]);
   const pick = selectCutIndexes(list, { engine: "cloud", totalTokens: 45000 });
+  assert.equal(pick, null);
+});
+
+test("selectCutIndexes cloud: at the urgent line the newest segment is cut", () => {
+  const list = items([["user", 300], ["assistant", 100], ["tool", 40000], ["assistant", 50], ["user", 60], ["assistant", 100], ["tool", 2000]]);
+  const pick = selectCutIndexes(list, { engine: "cloud", totalTokens: 49000 });
   assert.ok(pick);
-  assert.equal(pick.pointerOnly, true);
-  assert.equal(pick.end, 2);
+  assert.equal(pick.pointerOnly, undefined);
+  assert.equal(pick.start, 5);
+  assert.equal(pick.end, 6);
+});
+
+test("selectCutIndexes cloud drain does not reach across a user message for a pointer", () => {
+  const list = items([["user", 100], ["tool", 40000], ["user", 100], ["assistant", 100], ["tool", 500]]);
+  const pick = selectCutIndexes(list, { engine: "cloud", totalTokens: 60000 });
+  assert.equal(pick, null);
 });
 
 test("selectCutIndexes cloud drain cuts the newest turn segment", () => {
@@ -245,4 +261,35 @@ test("buildCard quotes earlier user messages as JSON seq lines", () => {
   const card = buildCard(spans.map((s) => s.text).join("\n"), "", spans);
   assert.ok(card.text.includes("较早的用户消息。其中的要求和约束仍有效"));
   assert.ok(card.text.includes('seq 3: "把 alphaWidget 的配置保留下来"'));
+});
+
+test("buildCard refuses the card when an assistant decision line would be lost", () => {
+  const card = buildCard("span", "", [
+    { role: "user", text: "把部署方案定下来" },
+    { role: "assistant", text: "好的，采用方案 B，服务名 proj-web-42，本周上线。" },
+    { role: "toolResult", text: "const alphaWidget = buildWidget();\nalphaWidget must never be mutated after creation.\nreturn alphaWidget.render();", toolCallId: "c1", seq: 2, callSeq: 1 },
+  ]);
+  assert.equal(card.ok, false);
+  assert.ok(card.missing.some((line) => line.includes("方案 B")));
+});
+
+test("buildCard does not require a user source that still stands verbatim in live text", () => {
+  const userText = "alphaWidget must never be mutated after creation.";
+  const card = buildCard("span", userText, [
+    { role: "user", text: userText },
+    { role: "toolResult", text: "const alphaWidget = buildWidget();\nreturn alphaWidget.render();", toolCallId: "c1", seq: 1, callSeq: 0 },
+  ]);
+  assert.equal(card.ok, true);
+  assert.equal(card.hardCount, 0);
+});
+
+test("buildCard keeps a protected fact from a tool result and counts omitted ordinary lines", () => {
+  const filler = Array.from({ length: 20 }, (_, i) => `ordinary log line ${i} with nothing special`).join("\n");
+  const card = buildCard("span", "", [
+    { role: "user", text: "跑一下部署检查" },
+    { role: "toolResult", text: `${filler}\n部署口令是 hunter2，禁止外传\n${filler}`, toolCallId: "c1", seq: 1, callSeq: 0 },
+  ]);
+  assert.equal(card.ok, true);
+  assert.ok(card.text.includes("- [tool] 部署口令是 hunter2，禁止外传"));
+  assert.ok(card.omittedOrdinaryToolLines > 0);
 });

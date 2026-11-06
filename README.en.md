@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.0.8, and the host-mechanism differences are
+card algorithm match upstream 1.0.9, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,18 +21,29 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Semantics at 1.0.8 (synced with upstream):
+Semantics at 1.0.9 (synced with upstream):
 
 - **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
   loopback / LAN / Tailscale-range address, counts as **local** (cuts as
   before, always after the last user message). Anything else is **cloud**:
-  below the keep budget (32K) regular spans are left alone and only oversized
-  tool results are pointerised; once the total plus predicted next-turn
-  growth passes the budget, draining starts — turn segments are cut one by
-  one until the total is back under budget. `SPINE_ENGINE=local|cloud`
-  forces the mode.
+  ordinary turns cut nothing at all (oversized tool results are no longer
+  pointerised on their own); draining starts only when the total plus an
+  observed next-turn growth baseline projects past the keep budget, or at
+  the 48000 urgent line — turn segments are then cut one by one until the
+  total is back under budget, with pointers searched only inside the
+  current tail segment and spans never crossing a card or the last user
+  message. `SPINE_ENGINE=local|cloud` forces the mode.
 - **The newest 3 finished tool rounds stay verbatim** (within a combined
-  32K-token budget); outside a drain, the cut must end before they start.
+  32K-token budget); every cut must end before they start, drains included —
+  the reservation is recomputed after each pass.
+- **The card coverage gate**: hard lines are attributed per source — hard
+  facts from user messages and from tool results (obligation keywords, plan
+  labels, kebab-case ids) must be retained under their own source id, and
+  if a decision-shaped line in assistant prose would be lost, the whole
+  card is refused.
+- **Official-compaction cooldown**: right after Pi's built-in compaction
+  produces a fresh summary, spine yields one pass instead of rolling the
+  summary into a card of its own (optional `SPINE_COOLDOWN_MS` window).
 - Hard lines are claimed only from non-assistant messages, and kept lines are
   tagged with their original role. Completion claims in assistant prose do not
   count as hard lines; tool evidence records only the turn, the command, the
@@ -42,8 +53,8 @@ Semantics at 1.0.8 (synced with upstream):
   structural signals (non-zero exit codes, `isError`, `[stderr]` markers) —
   never from keywords.
 - **Oversized tool results** (a single result over 32K tokens, adjustable)
-  are not excerpted at all: the whole round is replaced by a pointer card
-  that records only "call at sequence N → result at sequence M".
+  are not excerpted at all in local mode or during a cloud drain: the whole
+  round is replaced by a pointer card that records only "call at sequence N → result at sequence M".
 - Every cut tool result leaves a **sequence pointer** on the card (its event
   number in the session log; the card states explicitly that it is not a
   backup file path). Earlier user messages inside a cut span are preserved
@@ -86,6 +97,7 @@ Same names and meanings as upstream:
 | `SPINE_KEEP_ROUNDS` | `3` | Newest finished tool rounds kept verbatim before the cut |
 | `SPINE_KEEP_ROUND_TOKENS` | `32000` | Combined token budget for the kept rounds (also the cloud drain target) |
 | `SPINE_ENGINE` | resolved from endpoint | Force the mode: `local` or `cloud` |
+| `SPINE_COOLDOWN_MS` | `0` (off) | Cooldown window (ms) after an official compaction; the identity rule (one skipped pass per new official card) is always on, this only adds a time-based backstop |
 | `SPINE_POINTER_TOKENS` | `32000` | A single tool result above this is pointerised, not excerpted |
 | `SPINE_CHUNK_MIN` | `1000` | Minimum gain (non-user tokens) for one cut |
 | `SPINE_CHUNK_MAX` | `32000` | Maximum tokens per cut |
@@ -103,7 +115,7 @@ below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 40 cases covering the card builder, engine resolution, span selection and the recall archive
+npm test   # node --test, 51 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
 ```
 
 ## License and origin

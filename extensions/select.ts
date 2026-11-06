@@ -1,4 +1,4 @@
-// Span selection ported from dsh-live-compact 1.0.8 index.js
+// Span selection ported from dsh-live-compact 1.0.9 index.js
 // (selectNewestChunk + plan.js selectCutIndexes). The DSH version walks a
 // host session surface with a per-node token meter; here the same walk runs
 // over plain entry records the extension builds from Pi's projected session
@@ -7,8 +7,11 @@
 // tool call from its result. The newest finished tool rounds (default 3,
 // within a token budget) are reserved — the cut must end before they start.
 // 1.0.7/1.0.8: selection splits by engine — local cuts only after the last
-// user message; cloud cuts only oversized results below the drain line and
-// drains turn by turn once the total (plus predicted growth) passes it.
+// user message; cloud drains turn by turn once the total (plus predicted
+// growth) passes the keep budget. 1.0.9: ordinary cloud turns cut nothing
+// at all (not even oversized-result pointers); only a drain or the urgent
+// line selects, pointers stay inside the current tail segment, and the
+// reservation is re-applied on every pass instead of being bypassed.
 
 import {
   buildCard,
@@ -78,6 +81,13 @@ export function isCardEntry(entry: SpanEntry): boolean {
   return entry.text.includes(MARK);
 }
 
+// Checkpoints stop span expansion and tail walks: our own cards, plus
+// Pi's official compaction summaries (upstream isCheckpoint likewise
+// covers both the spine kind and the official compact-checkpoint kind).
+export function isCheckpointEntry(entry: SpanEntry): boolean {
+  return isCardEntry(entry) || entry.role === "compactionSummary";
+}
+
 function balancedAfter(entries: SpanEntry[], spanStart: number, end: number): boolean {
   const resultIndex = new Map<string, number>();
   entries.forEach((entry, i) => {
@@ -138,7 +148,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     if (!shortTail) break;
     end -= 1;
   }
-  while (end >= first && isCardEntry(entries[end])) end -= 1;
+  while (end >= first && isCheckpointEntry(entries[end])) end -= 1;
   while (end >= first && !balancedAfter(entries, first, end)) end -= 1;
 
   // Reserve the newest finished tool rounds: the cut ends before them.
@@ -162,7 +172,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   if (cutEnd !== null && span) {
     for (let index = visible[span.start].index; index <= visible[span.end].index; index += 1) keptTokens += entries[index].tokens;
     end = cutEnd;
-    while (end >= first && (isCardEntry(entries[end]) || entries[end].role === "user")) end -= 1;
+    while (end >= first && (isCheckpointEntry(entries[end]) || entries[end].role === "user")) end -= 1;
     while (end >= first && !balancedAfter(entries, first, end)) end -= 1;
   }
   if (end < first) return null;
@@ -171,7 +181,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   const items: CutItem[] = entries.map((entry, index) => ({
     type: itemType(entry),
     tokens: entry.tokens,
-    checkpoint: isCardEntry(entry),
+    checkpoint: isCheckpointEntry(entry),
     balancedBefore: balancedBefore(entries, index),
     balancedAfter: balancedAfter(entries, first, index),
   }));
@@ -184,7 +194,6 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     totalTokens: opts.totalTokens,
     drain: opts.drain,
     urgentTokens: URGENT_TOKENS,
-    keepBudget: KEEP_ROUND_TOKENS,
   });
   if (!picked) return null;
 
@@ -239,9 +248,11 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
       omittedHard: 0,
       deferred: 0,
       missing: [],
+      omittedOrdinaryToolLines: 0,
       uncovered: "",
       keptChars: text.length,
       needsBackup: false,
+      rawPaths: [],
       text,
     };
     return {
@@ -257,7 +268,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
 
   const start = picked.start;
   const finalEnd = picked.end;
-  if (isCardEntry(entries[start])) return null;
+  if (isCheckpointEntry(entries[start])) return null;
   const card = buildCard(spanText(start, finalEnd), liveText(start, finalEnd), spanObjs(start, finalEnd));
   if (!card.ok) return null;
   if (!balancedAfter(entries, start, finalEnd)) return null;
