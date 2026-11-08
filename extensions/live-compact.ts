@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.0.9
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.1.1
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -8,12 +8,18 @@
 // is replaced by the card, the rest are omitted, and the raw entries stay in
 // the session file (so Pi needs no shadow directory — see PORTING.md).
 //
-// 1.0.9 behaviour carried over: selection splits by engine (local
-// endpoints cut like the original; cloud endpoints cut nothing on an
-// ordinary turn — not even oversized-result pointers — and only drain,
+// Behaviour carried over: selection splits by engine (local endpoints
+// cut like the original; cloud endpoints cut nothing on an ordinary
+// turn — not even oversized-result pointers — and only drain,
 // turn-segment by turn-segment, once the total plus an observed growth
-// baseline projects past the keep budget, or at the urgent line), and
-// upstream's multi-pass drain is folded into one turn_end by selecting
+// baseline projects past the keep budget, or at the urgent line).
+// 1.1.0 adds the checkpoint floor: no cut may end at or left of the
+// newest card, so a pass that lands a card is not followed by another
+// cut reaching past it into the cached prefix. 1.1.1 adds the
+// long-read exception: a round holding a `read` result of at least
+// CHUNK_MIN drops out of the kept-rounds reservation and may be cut
+// confined to its own round, even on an ordinary cloud turn.
+// Upstream's multi-pass drain is folded into one turn_end by selecting
 // against a simulated entry list and returning every pass's edits
 // together. After Pi's own compaction lands a fresh summary, one pass
 // yields (cooldown, PORTING.md #22).

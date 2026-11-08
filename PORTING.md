@@ -1,6 +1,6 @@
 # PORTING.md — 与 DSH 原版的逐项差异
 
-原版：dsh-live-compact 1.0.9（MerkyorLynn，MIT）。本表只记「被迫不同」处；
+原版：dsh-live-compact 1.1.1（MerkyorLynn，MIT）。本表只记「被迫不同」处；
 没列的即与原版一致（阈值、卡片算法、安全门、保留轮规则、双模式选段、文案结构）。
 
 | # | 方面 | DSH 原版 | Pi 版 | 为什么 |
@@ -27,5 +27,9 @@
 | 20 | 云端选段收紧（1.0.9） | 普通云端轮次什么都不切（超大结果也不再单独指针化）；只有 drain 或总量 ≥48000 才选段，指针只在当前尾段内找、扩段不越卡片与最后一条 user；本地支的 oversized 预扫描删除 | 逐行同步，无 Pi 侧差异；Pi 的官方 compaction 摘要（role `compactionSummary`）与自家卡一并算 checkpoint（原版 isCheckpoint 同样含官方 kind） | 原版行为变更，照单全收；2026-11-06 冒烟验：cloud 普通轮（总量 28K）零切割、drain 场景切割与答全照常 |
 | 21 | 卡片覆盖门（1.0.9） | buildCard 全面改走来源溯源：原文按来源编号，硬行只从用户来源与工具摘录统计（`hasProtectedToolFact` 认硬事实）认，保留行逐行核对来源 id（checkCoverage）；助手正文里的决策形行（kebab 编号/`方案 X`）若会丢失，整卡否决；整段原文仍在未切区逐字站立的来源不再重复要求 | 逐行同步；Pi 侧 spans 由 select.ts 构造、无宿主 raw 备份字段，`rawPaths` 恒空 | 原版行为变更，照单全收；单测钉了三条：助手决策行否决、整段在 live 中不重复要求、工具硬事实经 stats 入卡 |
 | 22 | 官方压缩冷却（1.0.9 新增 cooldown.js） | 宿主官方压缩产出新卡（source.kind `compact-checkpoint`）后，spine 的下一次动作跳过一刀（按 seq 判、每张新卡只跳一次）；可选时间窗 `SPINE_COOLDOWN_MS` 默认 0＝关 | 同语义映射到 Pi：投影里 `sourceEntry.type === "compaction"` 的最新条目 id 作判据，状态存扩展实例内；时间窗 env 同名同义 | Pi 的官方摘要以 compaction 条目投影（role `compactionSummary`），无 source.kind 可读，条目 id 是等价的身份判据；处理器级单测验过「跳一刀、再切如常、新 compaction 再跳一次」 |
+
+| 23 | 卡片地板（1.1.0，issue #19） | 最新一张卡片当成地板：选段的 end 不得 ≤ 地板（`walkOffTail` 遇卡即停、`cutCrossesNewerCheckpoint` 兜底切点右侧有更新的卡片）；保留区 cutEnd 正落在卡上时整刀作罢——且这发生在长 read 试切之前，作者在 issue #19 已定版保留（宁可少切一刀，不跨卡片；该轮下一轮尾巴右移后自然成为候选） | 逐行同步，无 Pi 侧差异；地板判据沿用 #6 的文本标记＋官方 compaction 条目 | 原版行为变更，照单全收；连带效果：一次收尾落下第一张卡后，后续普通刀即被地板挡住（上游真机复测证实为 1.1.1 的实际行为、非记账假象），Pi 的模拟多刀（#15）在模拟表上同理——刚落的模拟卡就是地板 |
+| 24 | 长 read 轮（1.1.1） | 一轮里有 ≥`CHUNK_MIN` 的 `read` 结果，该轮即长 read 轮：不进保留轮（`keptToolRounds` 过滤）；选段时先在该轮自身范围内试切（`cutLongReadRound`：轮内单个结果 ≥指针线只留指针，否则轮内强制 drain 选段），切不下才回普通选段；普通云端轮次也可切长 read 轮（宿主侧仍受 `MAX_TAIL` 门约束） | 逐行同步；longRead 标记取条目的调用名 `call.name === "read"` 且条目 token ≥ `CHUNK_MIN`（token 为 Pi 侧估算，差异同 #4） | 原版行为变更，照单全收；单测钉了：普通云端轮切长 read 轮且不卷保留轮、超大 read 出指针、非 read 超大结果普通轮仍不切、长 read 轮不被保留 |
+| 25 | 宿主侧性能与 Windows 权限（1.1.0 scan-once、1.1.1 捕获游标/ACL/adapter） | 1.1.0 一个空闲回合只拷贝一次日志、工具结果到达时增量记调用表、计量只在开头与每刀后各一次、drain 重写只记一次账（`flushDrainStats`＋`spine-cuts.jsonl`）；1.1.1 捕获游标落盘（重启只补最近 3 轮）、Windows 上取 SID 与写 ACL 改走 System32 固定路径＋`/inheritance:r /grant:r`、权限失败熔断且不再让宿主退出、DSH 包名收敛到 `adapter.js` | 不移植 | 全是 DSH 宿主机制：Pi 每 turn_end 从投影现建条目表，没有逐事件捕获与整份日志拷贝；没有 shadow 目录，也就没有 ACL 与备份熔断（sidecar 是普通文件）；drain 记账属 #13 的累计统计范畴；Pi 侧唯一的外部导入是 typebox，无包名收敛问题 |
 
 已知未覆盖：DSH 原版的 `SPINE_SHADOW_DIR`、`DSH_HOME` 环境变量在 Pi 版无对应物（见 #13）。

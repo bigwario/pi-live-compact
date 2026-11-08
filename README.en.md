@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.0.9, and the host-mechanism differences are
+card algorithm match upstream 1.1.1, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,13 +21,14 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Semantics at 1.0.9 (synced with upstream):
+Semantics at 1.1.1 (synced with upstream):
 
 - **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
   loopback / LAN / Tailscale-range address, counts as **local** (cuts as
   before, always after the last user message). Anything else is **cloud**:
   ordinary turns cut nothing at all (oversized tool results are no longer
-  pointerised on their own); draining starts only when the total plus an
+  pointerised on their own; the one exception is a long-read round, below);
+  draining starts only when the total plus an
   observed next-turn growth baseline projects past the keep budget, or at
   the 48000 urgent line — turn segments are then cut one by one until the
   total is back under budget, with pointers searched only inside the
@@ -35,7 +36,17 @@ Semantics at 1.0.9 (synced with upstream):
   message. `SPINE_ENGINE=local|cloud` forces the mode.
 - **The newest 3 finished tool rounds stay verbatim** (within a combined
   32K-token budget); every cut must end before they start, drains included —
-  the reservation is recomputed after each pass.
+  the reservation is recomputed after each pass. Rounds holding a long read
+  are exempt from the reservation (see the long-read bullet below).
+- **Checkpoint floor** (1.1.0): the newest card is a floor — no cut may end
+  on it or to its left, so the already-cached prefix is never rewritten;
+  when the reservation boundary lands exactly on the card, the cut is
+  skipped entirely.
+- **Long-read rounds** (1.1.1): a round containing a `read` result of at
+  least 1000 tokens is tried on its own — the cut stays inside that round
+  and never drags the short rounds after it along; a single result at 32K+
+  inside it is pointerised. If that round cannot be cut, selection falls
+  back to the ordinary rules for an earlier round.
 - **The card coverage gate**: hard lines are attributed per source — hard
   facts from user messages and from tool results (obligation keywords, plan
   labels, kebab-case ids) must be retained under their own source id, and
@@ -115,7 +126,7 @@ below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 51 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
+npm test   # node --test, 61 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
 ```
 
 ## License and origin

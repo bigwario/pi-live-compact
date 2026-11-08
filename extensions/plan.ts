@@ -1,4 +1,4 @@
-// Card builder and cut planning ported from dsh-live-compact 1.0.9 plan.js
+// Card builder and cut planning ported from dsh-live-compact 1.1.1 plan.js
 // (MIT, MerkyorLynn). Semantics follow the upstream file function by
 // function; host plumbing is adapted to Pi in select.ts / live-compact.ts.
 // See PORTING.md.
@@ -389,6 +389,7 @@ export function admitEvidence(lines: string[], ids: Set<string>): string[] {
 export interface RoundEvent {
   type: string;
   toolCalls: number;
+  longRead?: boolean;
 }
 
 export interface ToolRound {
@@ -419,10 +420,46 @@ export function finishedToolRounds(events: RoundEvent[]): ToolRound[] {
   return rounds;
 }
 
+export function roundHasLongRead(events: RoundEvent[], round: ToolRound): boolean {
+  for (let index = round.start; index <= round.end; index += 1) {
+    if (events[index]?.longRead) return true;
+  }
+  return false;
+}
+
 export function keptToolRounds(events: RoundEvent[], limit = 3): ToolRound[] {
   const count = Number.isInteger(limit) && limit > 0 ? limit : 3;
-  const rounds = finishedToolRounds(events);
+  // 1.1.1: a round containing a long read is never kept — it is the
+  // long-read cut's business, not the reservation's.
+  const rounds = finishedToolRounds(events).filter((round) => !roundHasLongRead(events, round));
   return rounds.slice(-count);
+}
+
+// 1.1.1: cut a long-read round on its own, never widening into the kept
+// rounds around it. A single result at pointerMax inside the round is
+// pointerised; otherwise selection runs confined to [start, end] with
+// drain forced (the caller's ordinary-turn gate does not apply here).
+export function cutLongReadRound(
+  items: CutItem[],
+  start: number,
+  end: number,
+  options: SelectCutOptions = {},
+): CutPick | null {
+  if (!Array.isArray(items) || start < 0 || end < start || end >= items.length) return null;
+  const pointerMax = options.pointerMax ?? options.chunkMax ?? 32000;
+  for (let index = end; index >= start; index -= 1) {
+    if (items[index]?.type === "tool" && (items[index].tokens || 0) >= pointerMax) {
+      return { start: index, end: index, tokens: items[index].tokens || 0, pointerOnly: true, gain: 0 };
+    }
+  }
+  const picked = selectCutIndexes(items, {
+    ...options,
+    drain: true,
+    minStart: start,
+    maxEnd: end,
+  });
+  if (!picked || picked.start < start || picked.end > end) return null;
+  return picked;
 }
 
 export function reservedCutEnd(keepStart: number, first: number): number | null {
@@ -535,7 +572,7 @@ export function resolveEngine(
   return { engine: "cloud", source: "address" };
 }
 
-// ---- cut selection over typed items (upstream 1.0.9 selectCutIndexes) ----
+// ---- cut selection over typed items (upstream 1.1.1 selectCutIndexes) ----
 
 export interface CutItem {
   type: string; // user | assistant | tool | system | other
@@ -564,13 +601,24 @@ function nonUserGain(items: CutItem[], start: number, end: number): number {
 function walkOffTail(items: CutItem[], end: number): number {
   while (end >= 0) {
     const item = items[end];
+    // 卡片是停止线。走到它就没有可切的尾巴，不能再往左切进已缓存的前缀。
+    // A checkpoint is the floor. Reaching it means the tail has nothing left to cut.
+    if (item.checkpoint) return -1;
     const shortUser = item.type === "user" && (item.tokens || 0) < 400;
-    if (item.type !== "assistant" && !shortUser && !item.checkpoint) break;
+    if (item.type !== "assistant" && !shortUser) break;
     end -= 1;
   }
   while (end >= 0 && items[end].type === "user") end -= 1;
-  while (end >= 0 && items[end].checkpoint) end -= 1;
+  if (end >= 0 && items[end].checkpoint) return -1;
   return end;
+}
+
+export function cutCrossesNewerCheckpoint(items: CutItem[], end: number): boolean {
+  if (!Array.isArray(items) || !Number.isInteger(end)) return false;
+  for (let index = end + 1; index < items.length; index += 1) {
+    if (items[index]?.checkpoint) return true;
+  }
+  return false;
 }
 
 function expandBack(
@@ -603,6 +651,7 @@ export interface SelectCutOptions {
   chunkMin?: number;
   chunkMax?: number;
   pointerMax?: number;
+  minStart?: number;
   maxEnd?: number | null;
   totalTokens?: number;
   drain?: boolean;
@@ -626,25 +675,29 @@ export function selectCutIndexes(items: CutItem[], opts: SelectCutOptions = {}):
   // bypassed here (the caller's passes re-reserve after each cut).
   const draining = drain || (typeof totalTokens === "number" && totalTokens >= urgentTokens);
   if (cloud && !draining) return null;
+  const lowerBound = Math.max(0, opts.minStart ?? 0);
   const limit = maxEnd === null ? items.length - 1 : maxEnd;
-  if (limit < 0) return null;
+  if (limit < lowerBound) return null;
   const lastUser = items.reduce((found, item, index) => (item.type === "user" ? index : found), -1);
   const firstUser = items.findIndex((item) => item.type === "user");
   const floor = firstUser >= 0 ? firstUser + 1 : 0;
   const end = walkOffTail(items, limit);
-  if (end < 0) return null;
+  if (end < lowerBound) return null;
+  // 切点右边还有卡片，说明这一刀在已缓存前缀里。不切。
+  // A checkpoint to the right means this span is inside the cached prefix. Do not cut.
+  if (cutCrossesNewerCheckpoint(items, end)) return null;
   if (!cloud) {
     if (lastUser >= 0 && end <= lastUser) return null;
     if ((items[end].tokens || 0) > pointerMax && items[end].type === "tool") return { start: end, end, tokens: items[end].tokens || 0, pointerOnly: true, gain: 0 };
     if ((items[end].tokens || 0) > chunkMax) return null;
-    const local = expandBack(items, end, Math.max(floor, lastUser), { crossUser: false, chunkMax });
+    const local = expandBack(items, end, Math.max(lowerBound, floor, lastUser), { crossUser: false, chunkMax });
     if (local.gain < chunkMin || !balancedPick(items, local.start, local.end)) return null;
     return local;
   }
   // In a drain, an oversized result is pointerised only inside the current
   // tail segment: the scan stops at a checkpoint or a user message.
   let pointer: CutPick | null = null;
-  for (let index = end; index >= 0; index -= 1) {
+  for (let index = end; index >= lowerBound; index -= 1) {
     if (items[index].checkpoint || items[index].type === "user") break;
     if (items[index].type === "tool" && (items[index].tokens || 0) > pointerMax) {
       pointer = { start: index, end: index, tokens: items[index].tokens || 0, pointerOnly: true, gain: 0 };
@@ -652,7 +705,7 @@ export function selectCutIndexes(items: CutItem[], opts: SelectCutOptions = {}):
     }
   }
   if ((items[end].tokens || 0) > pointerMax && items[end].type === "tool") return { start: end, end, tokens: items[end].tokens || 0, pointerOnly: true, gain: 0 };
-  const phase = expandBack(items, end, 0, { crossUser: false, chunkMax });
+  const phase = expandBack(items, end, lowerBound, { crossUser: false, chunkMax });
   // Under chunkMin, stop; do not cross a checkpoint or the last user to
   // find another span.
   if (phase.gain < chunkMin) return pointer;

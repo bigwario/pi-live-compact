@@ -1,4 +1,4 @@
-// Span selection ported from dsh-live-compact 1.0.9 index.js
+// Span selection ported from dsh-live-compact 1.1.1 index.js
 // (selectNewestChunk + plan.js selectCutIndexes). The DSH version walks a
 // host session surface with a per-node token meter; here the same walk runs
 // over plain entry records the extension builds from Pi's projected session
@@ -12,21 +12,30 @@
 // at all (not even oversized-result pointers); only a drain or the urgent
 // line selects, pointers stay inside the current tail segment, and the
 // reservation is re-applied on every pass instead of being bypassed.
+// 1.1.0: the newest checkpoint is a floor — a cut may not end at or left
+// of it, so an already-cached prefix is never rewritten (issue #19).
+// 1.1.1: a round holding a long read (>= CHUNK_MIN from a `read` call)
+// drops out of the reservation and is tried first, cut confined to its
+// own round; an oversized single result inside it is pointerised.
 
 import {
   buildCard,
   chooseKeptSpan,
+  cutLongReadRound,
+  finishedToolRounds,
   keptToolRounds,
   MARK,
   pointerOnlyText,
   pointerSpanAllowed,
   RAIL_TOKENS,
   reservedCutEnd,
+  roundHasLongRead,
   selectCutIndexes,
   TRUNK_SCOPE,
   type Card,
   type CardSpan,
   type CutItem,
+  type CutPick,
   type RoundEvent,
 } from "./plan.ts";
 
@@ -142,25 +151,40 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   const engine = opts.engine ?? "cloud";
   const first = entries[0].role === "system" ? 1 : 0;
   let end = entries.length - 1;
+  // 1.1.0: the newest checkpoint is the floor. No walk below may cross
+  // it — a cut ending at or left of it would rewrite the cached prefix.
+  let floorCard = -1;
+  for (let index = first; index <= end; index += 1) {
+    if (isCheckpointEntry(entries[index])) floorCard = index;
+  }
   while (end >= first) {
+    if (floorCard >= 0 && end <= floorCard) return null;
     const entry = entries[end];
     const shortTail = entry.role === "assistant" || (entry.role === "user" && entry.tokens < 400);
     if (!shortTail) break;
     end -= 1;
   }
-  while (end >= first && isCheckpointEntry(entries[end])) end -= 1;
+  if (floorCard >= 0 && end <= floorCard) return null;
   while (end >= first && !balancedAfter(entries, first, end)) end -= 1;
 
   // Reserve the newest finished tool rounds: the cut ends before them.
+  // 1.1.1: a tool result from a `read` call at >= CHUNK_MIN marks its
+  // round as a long-read round; keptToolRounds drops those from the
+  // reservation and the round is tried as its own cut below.
   const visible: (RoundEvent & { index: number })[] = [];
   for (let index = first; index <= end; index += 1) {
     visible.push({
       index,
       type: entries[index].role === "toolResult" ? "tool" : "other",
       toolCalls: entries[index].toolCalls.length,
+      longRead:
+        entries[index].role === "toolResult" &&
+        entries[index].call?.name === "read" &&
+        entries[index].tokens >= CHUNK_MIN,
     });
   }
   const rounds = keptToolRounds(visible, KEEP_ROUNDS);
+  const newestLong = [...finishedToolRounds(visible)].reverse().find((round) => roundHasLongRead(visible, round));
   const span = chooseKeptSpan(rounds, (from, to) => {
     let tokens = 0;
     for (let index = visible[from.start].index; index <= visible[to.end].index; index += 1) tokens += entries[index].tokens;
@@ -172,10 +196,25 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   if (cutEnd !== null && span) {
     for (let index = visible[span.start].index; index <= visible[span.end].index; index += 1) keptTokens += entries[index].tokens;
     end = cutEnd;
-    while (end >= first && (isCheckpointEntry(entries[end]) || entries[end].role === "user")) end -= 1;
-    while (end >= first && !balancedAfter(entries, first, end)) end -= 1;
+    while (end >= first && entries[end].role === "user" && !(floorCard >= 0 && end - 1 <= floorCard)) end -= 1;
+    if (floorCard >= 0 && end <= floorCard) return null;
+    if (isCheckpointEntry(entries[end])) return null;
+    while (end >= first && !balancedAfter(entries, first, end)) {
+      if (floorCard >= 0 && end - 1 <= floorCard) return null;
+      end -= 1;
+    }
+    if (floorCard >= 0 && end <= floorCard) return null;
   }
-  if (end < first) return null;
+  // Settled upstream on issue #19: when the reservation's cutEnd lands
+  // on the floor card, the checks above return null before the long-read
+  // span below is tried. That is intentional — never reach across a card
+  // for one long read; the kept window slides right next turn and the
+  // round becomes a candidate then.
+  const longSpan =
+    newestLong && visible[newestLong.start].index > floorCard
+      ? { start: visible[newestLong.start].index, end: visible[newestLong.end].index }
+      : null;
+  if (!longSpan && (end < first || isCheckpointEntry(entries[end]))) return null;
   const maxEnd = end;
 
   const items: CutItem[] = entries.map((entry, index) => ({
@@ -185,7 +224,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     balancedBefore: balancedBefore(entries, index),
     balancedAfter: balancedAfter(entries, first, index),
   }));
-  const picked = selectCutIndexes(items, {
+  const cutOptions = {
     engine,
     chunkMin: CHUNK_MIN,
     chunkMax: CHUNK_MAX,
@@ -194,7 +233,20 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     totalTokens: opts.totalTokens,
     drain: opts.drain,
     urgentTokens: URGENT_TOKENS,
-  });
+  };
+  let usedLongCut = false;
+  let picked: CutPick | null = null;
+  if (longSpan) {
+    const longPicked = cutLongReadRound(items, longSpan.start, longSpan.end, cutOptions);
+    if (longPicked && longPicked.start >= longSpan.start && longPicked.end <= longSpan.end) {
+      picked = longPicked;
+      usedLongCut = true;
+    }
+  }
+  if (!picked) {
+    if (end < first || isCheckpointEntry(entries[end])) return null;
+    picked = selectCutIndexes(items, cutOptions);
+  }
   if (!picked) return null;
 
   const callSeqOf = new Map<string, number>();
@@ -224,6 +276,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     if (!callId) return null;
     const pairStart = entries.findIndex((entry) => entry.toolCalls.includes(callId));
     if (pairStart < 0 || pairStart > resultAt) return null;
+    if (usedLongCut && longSpan && pairStart < longSpan.start) return null;
     if (!pointerSpanAllowed(items, pairStart, resultAt, engine)) return null;
     if (items[pairStart].balancedBefore === false) return null;
     // Port-side guard (PORTING.md): replacing the call entry also drops any
@@ -265,6 +318,8 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
       pointerOnly: true,
     };
   }
+
+  if (usedLongCut && longSpan && (picked.start < longSpan.start || picked.end > longSpan.end)) return null;
 
   const start = picked.start;
   const finalEnd = picked.end;

@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import {
   buildCard,
   compactionRoute,
+  cutCrossesNewerCheckpoint,
+  cutLongReadRound,
   estimateTokens,
   exitCodeOf,
   isLocalHost,
   isToolFailure,
+  keptToolRounds,
   planText,
   pointerOnlyText,
   pointerSpanAllowed,
@@ -14,6 +17,7 @@ import {
   selectCutIndexes,
   type CardSpan,
   type CutItem,
+  type RoundEvent,
 } from "../extensions/plan.ts";
 
 test("buildCard without spans attributes nothing and keeps no lines, ok", () => {
@@ -232,6 +236,92 @@ test("selectCutIndexes cloud drain cuts the newest turn segment", () => {
   assert.equal(pick.pointerOnly, undefined);
   assert.equal(pick.start, 4);
   assert.equal(pick.end, 5);
+});
+
+test("keptToolRounds never keeps a round holding a long read (1.1.1)", () => {
+  const events: RoundEvent[] = [
+    { type: "other", toolCalls: 1 },
+    { type: "tool", toolCalls: 0, longRead: true },
+    { type: "other", toolCalls: 1 },
+    { type: "tool", toolCalls: 0 },
+  ];
+  const kept = keptToolRounds(events, 3);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].end, 3);
+});
+
+test("keptToolRounds drops a multi-tool round when one result is a long read (1.1.1)", () => {
+  const events: RoundEvent[] = [
+    { type: "other", toolCalls: 2 },
+    { type: "tool", toolCalls: 0, longRead: true },
+    { type: "tool", toolCalls: 0 },
+    { type: "other", toolCalls: 1 },
+    { type: "tool", toolCalls: 0 },
+  ];
+  const kept = keptToolRounds(events, 3);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].end, 4);
+});
+
+test("cutLongReadRound stays inside its round and pointerises an oversized result (1.1.1)", () => {
+  const keptSeg: CutItem[] = [0, 1, 2].flatMap(() => [
+    { type: "assistant", tokens: 16, balancedBefore: true, balancedAfter: false },
+    { type: "tool", tokens: 40, balancedBefore: false, balancedAfter: true },
+  ]);
+  const old: CutItem[] = [
+    { type: "assistant", tokens: 16, balancedBefore: true, balancedAfter: false },
+    { type: "tool", tokens: 1800, balancedBefore: false, balancedAfter: true },
+  ];
+  const longRead: CutItem[] = [
+    { type: "assistant", tokens: 16, balancedBefore: true, balancedAfter: false },
+    { type: "tool", tokens: 1600, balancedBefore: false, balancedAfter: true },
+  ];
+  const list = [...old, ...keptSeg, ...longRead];
+  const start = old.length + keptSeg.length;
+  const picked = cutLongReadRound(list, start, list.length - 1, { engine: "cloud", chunkMin: 1000, chunkMax: 32000, pointerMax: 32000 });
+  assert.ok(picked);
+  assert.equal(picked.start, start);
+  assert.equal(picked.end, list.length - 1);
+
+  const huge: CutItem[] = [
+    { type: "assistant", tokens: 16, balancedBefore: true, balancedAfter: false },
+    { type: "tool", tokens: 32000, balancedBefore: false, balancedAfter: false },
+    { type: "tool", tokens: 32000, balancedBefore: false, balancedAfter: true },
+  ];
+  const oversized = cutLongReadRound(huge, 0, huge.length - 1, { engine: "cloud", chunkMin: 1000, chunkMax: 32000, pointerMax: 32000 });
+  assert.ok(oversized);
+  assert.equal(oversized.pointerOnly, true);
+  assert.ok(oversized.start >= 1);
+  assert.equal(oversized.end, oversized.start);
+});
+
+test("cutLongReadRound returns null when the round cannot balance (1.1.1)", () => {
+  const blocked: CutItem[] = [
+    { type: "assistant", tokens: 16, balancedBefore: true, balancedAfter: false },
+    { type: "tool", tokens: 20000, balancedBefore: false, balancedAfter: false },
+    { type: "tool", tokens: 20000, balancedBefore: false, balancedAfter: true },
+  ];
+  assert.equal(cutLongReadRound(blocked, 0, 2, { engine: "cloud", chunkMin: 1000, chunkMax: 32000, pointerMax: 32000 }), null);
+});
+
+test("selectCutIndexes stops at a checkpoint floor (1.1.0, issue 19)", () => {
+  const list: CutItem[] = [
+    { type: "user", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "tool", tokens: 20000, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "other", tokens: 200, checkpoint: true, balancedAfter: true, balancedBefore: true },
+    { type: "user", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "tool", tokens: 8000, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "user", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "tool", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "tool", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+    { type: "tool", tokens: 100, checkpoint: false, balancedAfter: true, balancedBefore: true },
+  ];
+  const cut = selectCutIndexes(list, { engine: "cloud", drain: true, totalTokens: 200000, maxEnd: 4 });
+  assert.ok(cut);
+  assert.ok(cut.start > 2);
+  assert.equal(cut.end, 4);
+  assert.equal(cutCrossesNewerCheckpoint(list, cut.end), false);
+  assert.equal(selectCutIndexes(list, { engine: "cloud", drain: true, totalTokens: 200000, maxEnd: 1 }), null);
 });
 
 test("pointerSpanAllowed rejects checkpoints and the live user message", () => {
