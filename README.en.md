@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.1.1, and the host-mechanism differences are
+card algorithm match upstream 1.1.3, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,7 +21,7 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Semantics at 1.1.1 (synced with upstream):
+Semantics at 1.1.3 (synced with upstream):
 
 - **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
   loopback / LAN / Tailscale-range address, counts as **local** (cuts as
@@ -55,6 +55,8 @@ Semantics at 1.1.1 (synced with upstream):
 - **Official-compaction cooldown**: right after Pi's built-in compaction
   produces a fresh summary, spine yields one pass instead of rolling the
   summary into a card of its own (optional `SPINE_COOLDOWN_MS` window).
+  A summary already present when a session is restored only primes the
+  baseline and never yields a pass (1.1.2).
 - Hard lines are claimed only from non-assistant messages, and kept lines are
   tagged with their original role. Completion claims in assistant prose do not
   count as hard lines; tool evidence records only the turn, the command, the
@@ -63,6 +65,11 @@ Semantics at 1.1.1 (synced with upstream):
   Failed tool results are excerpted first, and failure is recognised only from
   structural signals (non-zero exit codes, `isError`, `[stderr]` markers) —
   never from keywords.
+- **Failed-tool diagnostics** (1.1.2): a failed result is kept whole while it
+  fits the tool budget; past the budget, root-cause lines (`*CAUSE`,
+  `TypeError`/`ValueError`, …) and the edges survive. JSON results keep both
+  streams, labelled stderr/stdout, and the failed block gains an
+  `[exit code: N]` line.
 - **Oversized tool results** (a single result over 32K tokens, adjustable)
   are not excerpted at all in local mode or during a cloud drain: the whole
   round is replaced by a pointer card that records only "call at sequence N → result at sequence M".
@@ -126,7 +133,7 @@ below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 61 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
+npm test   # node --test, 67 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
 ```
 
 ## License and origin

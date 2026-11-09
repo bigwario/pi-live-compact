@@ -1,6 +1,6 @@
 # PORTING.md — 与 DSH 原版的逐项差异
 
-原版：dsh-live-compact 1.1.1（MerkyorLynn，MIT）。本表只记「被迫不同」处；
+原版：dsh-live-compact 1.1.3（MerkyorLynn，MIT）。本表只记「被迫不同」处；
 没列的即与原版一致（阈值、卡片算法、安全门、保留轮规则、双模式选段、文案结构）。
 
 | # | 方面 | DSH 原版 | Pi 版 | 为什么 |
@@ -31,5 +31,9 @@
 | 23 | 卡片地板（1.1.0，issue #19） | 最新一张卡片当成地板：选段的 end 不得 ≤ 地板（`walkOffTail` 遇卡即停、`cutCrossesNewerCheckpoint` 兜底切点右侧有更新的卡片）；保留区 cutEnd 正落在卡上时整刀作罢——且这发生在长 read 试切之前，作者在 issue #19 已定版保留（宁可少切一刀，不跨卡片；该轮下一轮尾巴右移后自然成为候选） | 逐行同步，无 Pi 侧差异；地板判据沿用 #6 的文本标记＋官方 compaction 条目 | 原版行为变更，照单全收；连带效果：一次收尾落下第一张卡后，后续普通刀即被地板挡住（上游真机复测证实为 1.1.1 的实际行为、非记账假象），Pi 的模拟多刀（#15）在模拟表上同理——刚落的模拟卡就是地板 |
 | 24 | 长 read 轮（1.1.1） | 一轮里有 ≥`CHUNK_MIN` 的 `read` 结果，该轮即长 read 轮：不进保留轮（`keptToolRounds` 过滤）；选段时先在该轮自身范围内试切（`cutLongReadRound`：轮内单个结果 ≥指针线只留指针，否则轮内强制 drain 选段），切不下才回普通选段；普通云端轮次也可切长 read 轮（宿主侧仍受 `MAX_TAIL` 门约束） | 逐行同步；longRead 标记取条目的调用名 `call.name === "read"` 且条目 token ≥ `CHUNK_MIN`（token 为 Pi 侧估算，差异同 #4） | 原版行为变更，照单全收；单测钉了：普通云端轮切长 read 轮且不卷保留轮、超大 read 出指针、非 read 超大结果普通轮仍不切、长 read 轮不被保留 |
 | 25 | 宿主侧性能与 Windows 权限（1.1.0 scan-once、1.1.1 捕获游标/ACL/adapter） | 1.1.0 一个空闲回合只拷贝一次日志、工具结果到达时增量记调用表、计量只在开头与每刀后各一次、drain 重写只记一次账（`flushDrainStats`＋`spine-cuts.jsonl`）；1.1.1 捕获游标落盘（重启只补最近 3 轮）、Windows 上取 SID 与写 ACL 改走 System32 固定路径＋`/inheritance:r /grant:r`、权限失败熔断且不再让宿主退出、DSH 包名收敛到 `adapter.js` | 不移植 | 全是 DSH 宿主机制：Pi 每 turn_end 从投影现建条目表，没有逐事件捕获与整份日志拷贝；没有 shadow 目录，也就没有 ACL 与备份熔断（sidecar 是普通文件）；drain 记账属 #13 的累计统计范畴；Pi 侧唯一的外部导入是 typebox，无包名收敛问题 |
+
+| 26 | 失败工具诊断保留（1.1.2，issue #33） | `failureKeptLines` 三处收紧：失败正文在工具预算内整段保留，不再只摘首尾；JSON 结果的 stderr 与 stdout 改为双流带标签保留（旧版 stderr 非空时整段丢弃 stdout）；失败行正则扩到大小写不敏感并认 `TypeError`/`ValueError` 与 `*CAUSE` 根因行、根因行另有专列保留；失败工具块在命令后多一行 `[exit code: N]` | 逐行同步，无 Pi 侧差异（Pi 的 `exitCodeOf` 早已能解析同样的结构信号） | 原版行为变更，照单全收；单测钉了四条：中段根因＋退出码、双流 JSON 根因、超预算双流仍保双根因且摘录不超 2400、超预算时 TypeError 靠新正则命中（四条在旧实现上均跑红） |
+| 27 | 官方压缩冷却的恢复基线（1.1.2，issue #29 第二项） | 恢复边界（`session.firstLiveSeq`）之前的历史官方卡只建立基线、永不触发跳过；只有实时新卡跳一刀，判据状态改放全局 WeakMap 以熬过引擎替换与热重载（`skipLiveOfficialCompaction`） | 同语义映射到 Pi：扩展实例首次观察到的投影状态只做基线（含当时已在场的 compaction 条目 id），此后出现的新 id 才跳一刀；Pi 无 `firstLiveSeq`、也无引擎热替换，实例首观即等价边界，状态仍存实例内的 tracker | 上游修的正是「重启后旧官方卡白跳一刀」；Pi 旧实现有同病（新实例首趟遇到历史 compaction 即跳过）。处理器级旧单测把白跳钉成预期行为，已按新语义改写并在测试内注明；tracker 纯函数另有两条单测 |
+| 28 | 1.1.2／1.1.3 的宿主侧其余变更 | ①设置系统：常用参数进 DSH 设置页与 preset 接管门（`settings.js`/`client.js`/`gate.js`），env 退为缺席兜底，全部默认值与 1.1.1 一致（issue #32）；②账号路由：`deepseek-account` 的根地址来源链与无地址判 cloud（issue #29 第一项，属 #14 的宿主配置来源链）；③过程通知：progress-rules 注入提醒按精确元数据契约判为非用户边界、卡上单列「插件通知」段（issue #29 第三项）；④提交前复检：异步摘要等待期间在最终提交面重验地板/用户边界/工具配对与 raw 备份在位（issue #36 另报的保留轮×地板饥饿修复建议上游尚未采纳，不在 1.1.3 内）；⑤shadow 全家：扫描不完整拒备份、独占目录跳扫与 60 秒校准、游标改逐会话文件、重启核验已有备份、Windows 完整替换 DACL、1.1.3 把工具结果捕获改出事件同步路径排队去重（issue #34）；⑥live-fill 测评与发版门禁大改 | 不移植 | 逐项核对后的归类：①Pi 无宿主设置面，参数仍走既有 env、同名同默认，行为无差；②Pi 无 deepseek-account 这一服务商与桌面账号迁移形态，模式判定输入仍按 #14；③通知的生产者是 DSH 插件 progress-rules，其事件元数据（`data.source`）在 Pi 投影里没有对应字段，Pi 侧已核无同名插件在装，未知注入在 Pi 仍按用户边界处理——与上游「未知通知保留边界」的保守口径一致；④Pi 的 turn_end 在同一份投影上同步算卡并一次交草案，没有 DSH 那种「选段→异步摘要→提交」的窗口，地板/边界/配对已在选段内判定；⑤⑥属 #13/#25 的 shadow 与宿主测评范畴 |
 
 已知未覆盖：DSH 原版的 `SPINE_SHADOW_DIR`、`DSH_HOME` 环境变量在 Pi 版无对应物（见 #13）。

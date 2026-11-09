@@ -7,6 +7,7 @@ import {
   cutLongReadRound,
   estimateTokens,
   exitCodeOf,
+  failureKeptLines,
   isLocalHost,
   isToolFailure,
   keptToolRounds,
@@ -15,6 +16,7 @@ import {
   pointerSpanAllowed,
   resolveEngine,
   selectCutIndexes,
+  toolExcerpt,
   type CardSpan,
   type CutItem,
   type RoundEvent,
@@ -113,6 +115,69 @@ test("long failed tool result keeps failure lines and asks for backup", () => {
   assert.ok(card.text.includes("Error: boom happened in module x"));
   assert.ok(card.text.includes("第 3 轮 `cargo test` 失败 [c7]"));
   assert.equal(card.needsBackup, true);
+});
+
+test("failed tool result keeps a middle root cause and its exit code (1.1.2, issue #33)", () => {
+  const text = [
+    "Error: build failed",
+    ...Array.from({ length: 8 }, (_, i) => `    at setup (file.js:${i + 1}:1)`),
+    "ROOT_CAUSE_ONLY_HERE=missing config key",
+    ...Array.from({ length: 8 }, (_, i) => `    at run (file.js:${i + 20}:1)`),
+    "last context",
+    "final context",
+    "[exit code: 23]",
+  ].join("\n");
+  const card = buildCard(text, "", [
+    { role: "toolResult", text, isError: true, toolCallId: "c10", seq: 10, callSeq: 9, turn: 2, command: "npm run build", name: "bash" },
+  ]);
+  assert.equal(card.ok, true);
+  assert.ok(card.text.includes("ROOT_CAUSE_ONLY_HERE=missing config key"));
+  assert.ok(card.text.includes("[exit code: 23]"));
+  assert.ok(card.text.includes("这是当时的报错原文"));
+});
+
+test("failed JSON result keeps causes from both stdout and stderr (1.1.2)", () => {
+  const text = JSON.stringify({
+    exitCode: 23,
+    stdout: { text: "STDOUT_CAUSE=missing setting\nstdout tail" },
+    stderr: { text: "STDERR_CAUSE=wrapper failed\nROOT_CAUSE=missing key" },
+  });
+  const card = buildCard(text, "", [
+    { role: "toolResult", text, toolCallId: "c11", seq: 11, callSeq: 10, turn: 2, command: "npm run build", name: "bash" },
+  ]);
+  assert.ok(card.text.includes("STDOUT_CAUSE=missing setting"));
+  assert.ok(card.text.includes("STDERR_CAUSE=wrapper failed"));
+  assert.ok(card.text.includes("ROOT_CAUSE=missing key"));
+  assert.ok(card.text.includes("[exit code: 23]"));
+  assert.ok(!card.text.includes("Done successfully"));
+});
+
+test("over-budget dual-stream failure still keeps both causes within the tool budget (1.1.2)", () => {
+  const text = JSON.stringify({
+    exitCode: 23,
+    stdout: { text: `${"stdout progress ".repeat(220)}\nSTDOUT_CAUSE=missing setting\nstdout tail` },
+    stderr: { text: `${"stderr progress ".repeat(220)}\nSTDERR_CAUSE=wrapper failed\nROOT_CAUSE=missing key` },
+  });
+  const excerpt = toolExcerpt([
+    { role: "toolResult", text, toolCallId: "c12", seq: 12, callSeq: 11, turn: 2, command: "npm run build", name: "bash" },
+  ]);
+  assert.ok(excerpt.text.length <= 2400);
+  assert.ok(excerpt.text.includes("STDOUT_CAUSE=missing setting"));
+  assert.ok(excerpt.text.includes("STDERR_CAUSE=wrapper failed"));
+  assert.ok(excerpt.text.includes("ROOT_CAUSE=missing key"));
+  assert.ok(excerpt.text.includes("[exit code: 23]"));
+});
+
+test("failureKeptLines picks up a TypeError past the edges when over budget (1.1.2)", () => {
+  const text = [
+    "running the nightly job",
+    ...Array.from({ length: 15 }, (_, i) => `progress note ${i} ${"x".repeat(150)}`),
+    "TypeError: cannot read properties of undefined",
+    "wrap-up line one",
+    "wrap-up line two",
+  ].join("\n");
+  const kept = failureKeptLines(text);
+  assert.ok(kept.some((line) => line.includes("TypeError: cannot read properties of undefined")));
 });
 
 test("long tool result without structural signal is status-unknown, tail kept", () => {

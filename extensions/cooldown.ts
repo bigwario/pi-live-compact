@@ -8,6 +8,12 @@
 // (SPINE_COOLDOWN_MS, default 0 = off) additionally skips passes that
 // start within the window after the compaction.
 //
+// 1.1.2 (upstream issue #29): a compaction that already sits in the
+// projection when this instance starts observing is restored history,
+// not a live event — it only primes the baseline and never makes a pass
+// yield. Upstream draws the same line with the session's firstLiveSeq;
+// Pi has no such boundary, so the tracker's first observation is it.
+//
 // Upstream reads the host surface for source.kind "compact-checkpoint";
 // Pi projects a compaction as an entry whose projected items carry
 // sourceEntry.type === "compaction", which is what is scanned here.
@@ -47,4 +53,30 @@ export function latestOfficialCompaction(projected: any[]): OfficialCompaction |
 export function inCooldownWindow(official: OfficialCompaction | null, windowMs: number, now = Date.now()): boolean {
   if (!official || !(windowMs > 0) || !official.time) return false;
   return now - official.time < windowMs;
+}
+
+/**
+ * Once-per-live-card tracker for the identity rule. The first observed
+ * state — with or without a compaction in it — only primes the baseline:
+ * a card already there is restored history and never yields a pass.
+ * Afterwards, a compaction whose id differs from the primed/last-seen id
+ * is live and yields exactly one pass; repeats of the same id do not.
+ */
+export function createOfficialCompactionTracker(): { observe(official: OfficialCompaction | null): boolean } {
+  let primed = false;
+  let seen: string | undefined;
+  return {
+    observe(official: OfficialCompaction | null): boolean {
+      if (!primed) {
+        primed = true;
+        seen = official?.id;
+        return false;
+      }
+      if (official && official.id !== seen) {
+        seen = official.id;
+        return true;
+      }
+      return false;
+    },
+  };
 }

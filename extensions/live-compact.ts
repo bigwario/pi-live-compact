@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.1.1
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.1.3
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -22,7 +22,11 @@
 // Upstream's multi-pass drain is folded into one turn_end by selecting
 // against a simulated entry list and returning every pass's edits
 // together. After Pi's own compaction lands a fresh summary, one pass
-// yields (cooldown, PORTING.md #22).
+// yields (cooldown, PORTING.md #22); a summary already present when the
+// instance starts only primes the baseline and never yields (1.1.2,
+// PORTING.md #27). Failed tool results keep their exit code and the
+// key causes from both output streams on the card (1.1.2, PORTING.md
+// #26).
 //
 // No model is called for the cuts themselves, exactly like the original's
 // spine cuts. When the card gate refuses (prose-heavy span), nothing is cut
@@ -45,7 +49,7 @@ import {
   resolveEngine,
 } from "./plan.ts";
 import { Type } from "typebox";
-import { inCooldownWindow, latestOfficialCompaction, resolveCooldownMs } from "./cooldown.ts";
+import { createOfficialCompactionTracker, inCooldownWindow, latestOfficialCompaction, resolveCooldownMs } from "./cooldown.ts";
 import { RecallStore, recallHint, recallResult, type RecallItem } from "./recall.ts";
 import { KEEP_ROUND_TOKENS, selectNewestChunk, URGENT_TOKENS, type CallInfo, type SpanEntry } from "./select.ts";
 
@@ -141,8 +145,9 @@ export default function liveCompact(pi: any) {
   // urgent-line trigger inside selection does not depend on it.
   let turnBase: number | null = null;
   let maxTurnGrowth = 0;
-  // Id of the newest official compaction already yielded to (cooldown).
-  let cooldownSeen: string | undefined;
+  // Cooldown tracker: restored official compactions only prime the
+  // baseline; each live one yields exactly one pass (PORTING.md #27).
+  const compactionTracker = createOfficialCompactionTracker();
 
   // Archive of cut tool-result originals, served by spine_recall.
   const store = new RecallStore();
@@ -186,13 +191,12 @@ export default function liveCompact(pi: any) {
     const hostTotal = typeof usage?.tokens === "number" ? usage.tokens : work.reduce((sum, e) => sum + e.tokens, 0);
     if (hostTotal < MIN_PRESSURE || hostTotal >= BIG_GATE) return;
 
-    // Cooldown (1.0.9): a fresh official compaction makes this pass yield
-    // once, so its summary is not rolled into a spine card right away.
+    // Cooldown (1.0.9, baseline rule 1.1.2): a fresh official compaction
+    // makes this pass yield once, so its summary is not rolled into a
+    // spine card right away; one already present at the first pass is
+    // restored history and never yields.
     const official = latestOfficialCompaction(projected);
-    if (official && official.id !== cooldownSeen) {
-      cooldownSeen = official.id;
-      return;
-    }
+    if (compactionTracker.observe(official)) return;
     if (inCooldownWindow(official, COOLDOWN_MS)) return;
 
     const { engine } = engineFor(ctx);

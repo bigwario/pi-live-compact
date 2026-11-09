@@ -5,7 +5,7 @@
 Live Compact 就是边做边压。活着的时候就压，不等窗口堆满。
 
 这是 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)（MerkyorLynn，MIT）
-到 Pi coding agent 的忠实移植：原理、阈值与卡片算法与原版 1.1.1 一致，
+到 Pi coding agent 的忠实移植：原理、阈值与卡片算法与原版 1.1.3 一致，
 宿主机制差异逐项记在 [PORTING.md](./PORTING.md)。
 
 Pi 自带 compaction 和 DSH 原版一样是「堆到阈值才调模型大压一次」。
@@ -14,7 +14,7 @@ Pi 自带 compaction 和 DSH 原版一样是「堆到阈值才调模型大压一
 被切段替换成一张抽取式卡片，且只有当卡片能证明「硬行一条没丢」时才下刀；
 散文占比太高的段不切，留给 Pi 自带 compaction，原理同原版的 wait-80 路由。
 
-当前语义（与上游 1.1.1 同步）：
+当前语义（与上游 1.1.3 同步）：
 
 - **双模式**：端点按地址判定——`strata` 服务商、loopback、局域网与 Tailscale
   段地址算**本地模式**（照旧积极切，切点只落在最后一条用户消息之后）；
@@ -39,10 +39,14 @@ Pi 自带 compaction 和 DSH 原版一样是「堆到阈值才调模型大压一
   助手正文里的决策形行若会被切丢，整张卡作废不切；
 - **官方压缩冷却**：Pi 自带 compaction 刚产出新摘要时，spine 让过一刀，
   不紧接着把人家摘要卷进自己的卡（可选时间窗 `SPINE_COOLDOWN_MS`）；
+  恢复会话时已在场的旧摘要只算基线、不触发让行（1.1.2）；
 - 硬行只从非助手消息里认，保留行逐行标原角色；助手说过的完成声明不算硬行，
   工具证据只写「第几轮、哪条命令、退出状态、调用编号」；
 - 短工具结果（≤12 行且 ≤512 字）整段留在卡上；失败的工具结果优先摘录，
   且只认结构信号（非 0 退出码、`isError`、`[stderr]` 等），不靠关键词猜；
+- **失败诊断保留**（1.1.2）：失败结果在工具预算内整段保留，超预算也保住
+  根因行（`*CAUSE`、`TypeError`/`ValueError` 等）与首尾；JSON 结果的
+  stderr 与 stdout 双流都带标签留在卡上，失败块另标一行退出码；
 - **超大工具结果**（单条超过 32K token，可调）在本地模式或云端 drain 时
   不摘录原文，整轮换成一张指针卡：只留「第几个序号的调用 → 第几个序号的结果」；
 - 每条被切的工具结果在卡上留**序号指针**（会话日志里的事件号，卡上明示
@@ -95,7 +99,7 @@ pi -e /path/to/pi-live-compact/extensions/live-compact.ts
 ## 测试
 
 ```sh
-npm test   # node --test，卡片构建器、模式判定、选段逻辑、取回存档、冷却与处理器接线共 61 个用例（handler 用例需 node_modules 里能解析到 typebox，在 Pi 机器上链到 Pi 自带的那份即可）
+npm test   # node --test，卡片构建器、模式判定、选段逻辑、取回存档、冷却与处理器接线共 67 个用例（handler 用例需 node_modules 里能解析到 typebox，在 Pi 机器上链到 Pi 自带的那份即可）
 ```
 
 ## 许可与来源

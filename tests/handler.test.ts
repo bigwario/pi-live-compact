@@ -69,15 +69,20 @@ test("turn_end cuts on the first pass when no official compaction exists", async
   assert.ok(result?.entries?.length > 0);
 });
 
-test("a fresh official compaction makes exactly one pass yield, then cuts resume", async (t) => {
+// Rewritten for upstream 1.1.2 (issue #29): a compaction already in the
+// projection at the first pass is restored history — it primes the
+// baseline and must NOT make a pass yield (the old test pinned exactly
+// that white-skip as expected behaviour). A card appearing later is live
+// and yields exactly once.
+test("a restored official compaction never yields; a live one yields exactly once (1.1.2)", async (t) => {
   if (!liveCompact) return t.skip("typebox not resolvable outside Pi");
   const { turnEnd, ctx } = makeExtension();
-  const first = await turnEnd(projected("comp-1"), ctx);
-  assert.equal(first, undefined);
-  const second = await turnEnd(projected("comp-1"), ctx);
-  assert.ok(second?.entries?.length > 0);
-  const third = await turnEnd(projected("comp-2"), ctx);
-  assert.equal(third, undefined);
-  const fourth = await turnEnd(projected("comp-2"), ctx);
-  assert.ok(fourth?.entries?.length > 0);
+  const restored = await turnEnd(projected("comp-1"), ctx);
+  assert.ok(restored?.entries?.length > 0);
+  const again = await turnEnd(projected("comp-1"), ctx);
+  assert.ok(again?.entries?.length > 0);
+  const live = await turnEnd(projected("comp-2"), ctx);
+  assert.equal(live, undefined);
+  const resumed = await turnEnd(projected("comp-2"), ctx);
+  assert.ok(resumed?.entries?.length > 0);
 });
