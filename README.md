@@ -5,7 +5,7 @@
 Live Compact 就是边做边压。活着的时候就压，不等窗口堆满。
 
 这是 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)（MerkyorLynn，MIT）
-到 Pi coding agent 的忠实移植：原理、阈值与卡片算法与原版 1.1.3 一致，
+到 Pi coding agent 的忠实移植：原理、阈值与卡片算法与原版 1.1.4 一致，
 宿主机制差异逐项记在 [PORTING.md](./PORTING.md)。
 
 Pi 自带 compaction 和 DSH 原版一样是「堆到阈值才调模型大压一次」。
@@ -14,7 +14,7 @@ Pi 自带 compaction 和 DSH 原版一样是「堆到阈值才调模型大压一
 被切段替换成一张抽取式卡片，且只有当卡片能证明「硬行一条没丢」时才下刀；
 散文占比太高的段不切，留给 Pi 自带 compaction，原理同原版的 wait-80 路由。
 
-当前语义（与上游 1.1.3 同步）：
+当前语义（与上游 1.1.4 同步）：
 
 - **双模式**：端点按地址判定——`strata` 服务商、loopback、局域网与 Tailscale
   段地址算**本地模式**（照旧积极切，切点只落在最后一条用户消息之后）；

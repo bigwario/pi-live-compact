@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.1.3, and the host-mechanism differences are
+card algorithm match upstream 1.1.4, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,7 +21,7 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Semantics at 1.1.3 (synced with upstream):
+Semantics at 1.1.4 (synced with upstream):
 
 - **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
   loopback / LAN / Tailscale-range address, counts as **local** (cuts as
