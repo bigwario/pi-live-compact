@@ -1,7 +1,7 @@
-// Card builder and cut planning ported from dsh-live-compact 1.1.1 plan.js
-// (MIT, MerkyorLynn). Semantics follow the upstream file function by
-// function; host plumbing is adapted to Pi in select.ts / live-compact.ts.
-// See PORTING.md.
+// Card builder and cut planning ported from dsh-live-compact plan.js
+// (MIT, MerkyorLynn; synced through 1.1.5). Semantics follow the upstream
+// file function by function; host plumbing is adapted to Pi in
+// select.ts / live-compact.ts. See PORTING.md.
 
 export const MARK = "Spine extract.";
 const KEEP_BUDGET = 8000;
@@ -249,6 +249,8 @@ function failureBody(text: string): string {
   if (raw.startsWith("{")) {
     try {
       const parsed = JSON.parse(raw);
+      // A bounded failed result keeps every field, not only the two streams.
+      if (raw.length <= TOOL_BUDGET) return raw;
       const streams: string[] = [];
       for (const [label, value] of [["stderr", parsed?.stderr?.text], ["stdout", parsed?.stdout?.text]] as const) {
         if (typeof value === "string" && value.trim()) {
@@ -265,8 +267,9 @@ function failureBody(text: string): string {
 
 export function failureKeptLines(text: string): string[] {
   const useful = usefulLines(failureBody(text));
-  if (useful.join("\n").length <= TOOL_BUDGET) return useful.map(shorten);
-  const marked = useful.filter((line) => FAILURE_LINE.test(line)).slice(-8).map(shorten);
+  if (useful.join("\n").length <= TOOL_BUDGET) return useful;
+  const markedLines = useful.filter((line) => FAILURE_LINE.test(line));
+  const marked = (markedLines.length > 8 ? [markedLines[0], ...markedLines.slice(-7)] : markedLines).map(shorten);
   const causes = useful.filter((line) => /(?:root|stderr|stdout)[ _-]*cause\b|CAUSE\b/i.test(line)).slice(-4).map(shorten);
   const edges = [...useful.slice(0, 1), ...useful.slice(-2)].map(shorten);
   const picked: string[] = [];
@@ -397,6 +400,7 @@ export interface RoundEvent {
   type: string;
   toolCalls: number;
   longRead?: boolean;
+  checkpoint?: boolean;
 }
 
 export interface ToolRound {
@@ -434,11 +438,15 @@ export function roundHasLongRead(events: RoundEvent[], round: ToolRound): boolea
   return false;
 }
 
-export function keptToolRounds(events: RoundEvent[], limit = 3): ToolRound[] {
+export function keptToolRounds(events: RoundEvent[], limit = 3, afterIndex = -1): ToolRound[] {
   const count = Number.isInteger(limit) && limit > 0 ? limit : 3;
+  const floor = Number.isInteger(afterIndex) ? afterIndex : -1;
   // 1.1.1: a round containing a long read is never kept — it is the
   // long-read cut's business, not the reservation's.
-  const rounds = finishedToolRounds(events).filter((round) => !roundHasLongRead(events, round));
+  // 1.1.5 (#36): the reservation restarts after the newest checkpoint —
+  // rounds at or left of it no longer fill the keep slots, so the floor
+  // and the reservation cannot stack into a double starvation.
+  const rounds = finishedToolRounds(events).filter((round) => round.start > floor && !roundHasLongRead(events, round));
   return rounds.slice(-count);
 }
 
@@ -748,7 +756,7 @@ export function pointerOnlyText(pieces: CardSpan[]): string {
   const lines = tools.map((piece) => {
     const cmd = piece.command || piece.name || "tool";
     const call = Number.isInteger(piece.callSeq) ? piece.callSeq : "?";
-    const flag = piece.isError ? " error" : "";
+    const flag = isToolFailure(piece.text, piece.isError) ? " error" : "";
     return `* ${piece.name || "tool"} "${cmd}" (seq ${call} -> result ${piece.seq}${flag})`;
   });
   const userBlock = users.length
@@ -789,7 +797,7 @@ export function commandLine(command: string | undefined): string {
   return `命令：${first.slice(0, 80)}`;
 }
 
-function toolBlock(span: CardSpan): { block: string; failed: boolean; needsBackup: boolean; hardLines: string[]; ordinaryLines: string[] } {
+function toolBlock(span: CardSpan): { block: string; failed: boolean; failureDiagnosticsComplete: boolean; needsBackup: boolean; hardLines: string[]; ordinaryLines: string[] } {
   const text = String(span.text || "").replace(/\n+$/, "");
   const lines = text.split("\n");
   const hardLines: string[] = [];
@@ -814,9 +822,15 @@ function toolBlock(span: CardSpan): { block: string; failed: boolean; needsBacku
   if (command) prefix.push(command);
   const exitCode = failed ? exitCodeOf(text) : null;
   if (exitCode !== null) prefix.push(`[exit code: ${exitCode}]`);
-  if (small) return { block: [...prefix, ...lines.map((line) => `│ ${line}`)].join("\n"), failed, needsBackup: false, hardLines, ordinaryLines };
-  if (failed) return { block: [...prefix, ...failureKeptLines(text).map((line) => `│ ${line}`)].join("\n"), failed, needsBackup: true, hardLines, ordinaryLines };
-  return { block: [...prefix, ...unknownKeptLines(text).map((line) => `│ ${line}`)].join("\n"), failed, needsBackup: true, hardLines, ordinaryLines };
+  if (small) return { block: [...prefix, ...lines.map((line) => `│ ${line}`)].join("\n"), failed, failureDiagnosticsComplete: true, needsBackup: false, hardLines, ordinaryLines };
+  if (failed) {
+    const original = text.trim();
+    const diagnostic = usefulLines(original.startsWith("{") ? original : failureBody(text));
+    const kept = failureKeptLines(text);
+    const failureDiagnosticsComplete = diagnostic.length === kept.length && diagnostic.every((line, index) => line === kept[index]);
+    return { block: [...prefix, ...kept.map((line) => `│ ${line}`)].join("\n"), failed, failureDiagnosticsComplete, needsBackup: true, hardLines, ordinaryLines };
+  }
+  return { block: [...prefix, ...unknownKeptLines(text).map((line) => `│ ${line}`)].join("\n"), failed, failureDiagnosticsComplete: true, needsBackup: true, hardLines, ordinaryLines };
 }
 
 export function fitFailure(block: string, budget: number): string {
@@ -834,13 +848,15 @@ export interface ToolExcerpt {
   text: string;
   omitted: number;
   needsBackup: boolean;
+  failureDiagnosticsComplete: boolean;
+  incompleteFailures: { sourceId?: number; reason: string }[];
   excerpts: { sourceId?: number; text: string }[];
   stats: { sourceId?: number; hardLines: string[]; omittedOrdinaryToolLines: number }[];
 }
 
 export function toolExcerpt(spans: CardSpan[], backupId = ""): ToolExcerpt {
   const tools = (spans || []).filter((span) => sourceRole(span.role) === "tool" && String(span.text || "").trim().length > 0);
-  if (tools.length === 0) return { text: "", omitted: 0, needsBackup: false, excerpts: [], stats: [] };
+  if (tools.length === 0) return { text: "", omitted: 0, needsBackup: false, failureDiagnosticsComplete: true, incompleteFailures: [], excerpts: [], stats: [] };
   let lastFailure = -1;
   tools.forEach((span, index) => {
     if (isToolFailure(span.text, span.isError)) lastFailure = index;
@@ -856,15 +872,22 @@ export function toolExcerpt(spans: CardSpan[], backupId = ""): ToolExcerpt {
   });
   const chosen: { index: number; sourceId?: number; block: string; text: string }[] = [];
   const stats: ToolExcerpt["stats"] = [];
+  const incompleteFailures = new Map<number, { sourceId?: number; reason: string }>();
   let used = 0;
   let needsBackup = false;
   for (const item of ranked) {
     const built = toolBlock(item.span);
+    const incomplete = (reason: string) => {
+      if (built.failed && !incompleteFailures.has(item.index)) incompleteFailures.set(item.index, { sourceId: item.span.id, reason });
+    };
+    if (!built.failureDiagnosticsComplete) incomplete("failed-tool-lines-truncated");
     let block = built.block;
     if (item.index === lastFailure && used + block.length > TOOL_BUDGET) {
+      incomplete("failed-tool-budget-truncated");
       block = fitFailure(block, Math.max(0, TOOL_BUDGET - used));
     }
     if (used + block.length > TOOL_BUDGET) {
+      incomplete("failed-tool-budget-omitted");
       needsBackup = true;
       stats.push({ sourceId: item.span.id, hardLines: built.hardLines, omittedOrdinaryToolLines: built.ordinaryLines.length });
       continue;
@@ -891,6 +914,8 @@ export function toolExcerpt(spans: CardSpan[], backupId = ""): ToolExcerpt {
     text: parts.join("\n"),
     omitted: skipped,
     needsBackup,
+    failureDiagnosticsComplete: incompleteFailures.size === 0,
+    incompleteFailures: [...incompleteFailures.values()],
     excerpts: chosen.map(({ sourceId, text }) => ({ sourceId, text })),
     stats,
   };
@@ -906,7 +931,7 @@ function pointerLines(spans: CardSpan[]): string[] {
     if (Number.isInteger(span.seq)) {
       const cmd = span.command || span.name || "tool";
       const call = Number.isInteger(span.callSeq) ? span.callSeq : "?";
-      const flag = span.isError ? " error" : "";
+      const flag = isToolFailure(span.text, span.isError) ? " error" : "";
       lines.push(`* ${span.name || "tool"} "${cmd}" (seq ${call} -> result ${span.seq}${flag})`);
       continue;
     }
@@ -934,6 +959,7 @@ function knownIds(spans: CardSpan[]): Set<string> {
 
 export interface Card {
   ok: boolean;
+  failureDiagnosticsComplete: boolean;
   verdict: string;
   scope: string;
   hardLines: string[];
@@ -1023,6 +1049,15 @@ export function buildCard(spanText: string, liveText = "", spans: CardSpan[] | n
     requiredLines: hard,
     keptLines: kept.map((item) => ({ sourceId: item.sourceId, text: item.line })),
   });
+  const incompleteFailures = tools.incompleteFailures.filter((item) => sourceById.has(item.sourceId as number));
+  for (const item of incompleteFailures) {
+    coverage.ok = false;
+    coverage.missing.push({
+      sourceId: item.sourceId,
+      text: `failed-tool-diagnostics-not-retained (seq ${sourceById.get(item.sourceId as number)?.seq ?? "?"})`,
+      reason: "failed-tool-diagnostics-not-retained",
+    });
+  }
   // Assistant decisions are never kept and never count as evidence; if a
   // decision-shaped assistant line would be lost, refuse the whole card.
   for (const source of sources) {
@@ -1074,6 +1109,7 @@ export function buildCard(spanText: string, liveText = "", spans: CardSpan[] | n
   ].filter(Boolean).join("\n");
   return {
     ok: coverage.ok,
+    failureDiagnosticsComplete: incompleteFailures.length === 0,
     verdict: coverage.ok ? "ok" : "incomplete",
     scope: TRUNK_SCOPE,
     hardLines: hard.map((item) => item.line),

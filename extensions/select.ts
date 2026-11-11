@@ -17,12 +17,17 @@
 // 1.1.1: a round holding a long read (>= CHUNK_MIN from a `read` call)
 // drops out of the reservation and is tried first, cut confined to its
 // own round; an oversized single result inside it is pointerised.
+// 1.1.5: the reservation restarts after the newest checkpoint (#36), and
+// a pointer cut never replaces a failed tool result (#33) — a span whose
+// card cannot retain the complete failure diagnostics is not cut at all
+// (the veto itself lives in plan.ts buildCard/toolExcerpt).
 
 import {
   buildCard,
   chooseKeptSpan,
   cutLongReadRound,
   finishedToolRounds,
+  isToolFailure,
   keptToolRounds,
   MARK,
   pointerOnlyText,
@@ -181,9 +186,11 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
         entries[index].role === "toolResult" &&
         entries[index].call?.name === "read" &&
         entries[index].tokens >= CHUNK_MIN,
+      checkpoint: isCheckpointEntry(entries[index]),
     });
   }
-  const rounds = keptToolRounds(visible, KEEP_ROUNDS);
+  const floorVisible = visible.reduce((found, item, index) => (item.checkpoint ? index : found), -1);
+  const rounds = keptToolRounds(visible, KEEP_ROUNDS, floorVisible);
   const newestLong = [...finishedToolRounds(visible)].reverse().find((round) => roundHasLongRead(visible, round));
   const span = chooseKeptSpan(rounds, (from, to) => {
     let tokens = 0;
@@ -272,6 +279,9 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
 
   if (picked.pointerOnly) {
     const resultAt = picked.end;
+    // 1.1.5 (#33): an identified failed result never goes pointer-only;
+    // its diagnostics must go through the card gate instead.
+    if (isToolFailure(entries[resultAt].text, entries[resultAt].isError)) return null;
     const callId = entries[resultAt].toolResultFor;
     if (!callId) return null;
     const pairStart = entries.findIndex((entry) => entry.toolCalls.includes(callId));
@@ -294,6 +304,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     const text = `${MARK}\n${pointerOnlyText(spanObjs(pairStart, resultAt))}`;
     const card: Card = {
       ok: true,
+      failureDiagnosticsComplete: true,
       verdict: "ok",
       scope: TRUNK_SCOPE,
       hardLines: [],

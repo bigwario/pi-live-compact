@@ -8,7 +8,7 @@ not after the window has filled up.
 This is a faithful port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
 (MerkyorLynn, MIT) to the Pi coding agent: the principles, thresholds and the
-card algorithm match upstream 1.1.4, and the host-mechanism differences are
+card algorithm match upstream 1.1.5, and the host-mechanism differences are
 listed one by one in [PORTING.md](./PORTING.md).
 
 Pi's built-in compaction works like DSH's stock behaviour: pile up to a
@@ -21,7 +21,7 @@ extractive card, and the cut only goes ahead when the card can prove that no
 hard line was lost. Spans whose prose share is too high are not cut and are
 left to Pi's built-in compaction — the same routing as upstream's wait-80.
 
-Semantics at 1.1.4 (synced with upstream):
+Semantics at 1.1.5 (synced with upstream):
 
 - **Two engine modes**, resolved from the endpoint: a `strata` provider, or a
   loopback / LAN / Tailscale-range address, counts as **local** (cuts as
@@ -37,7 +37,10 @@ Semantics at 1.1.4 (synced with upstream):
 - **The newest 3 finished tool rounds stay verbatim** (within a combined
   32K-token budget); every cut must end before they start, drains included —
   the reservation is recomputed after each pass. Rounds holding a long read
-  are exempt from the reservation (see the long-read bullet below).
+  are exempt from the reservation (see the long-read bullet below). The
+  reservation only counts rounds after the newest card (1.1.5), so rounds
+  left of a card no longer fill its slots and stack with the checkpoint
+  floor into a double starvation.
 - **Checkpoint floor** (1.1.0): the newest card is a floor — no cut may end
   on it or to its left, so the already-cached prefix is never rewritten;
   when the reservation boundary lands exactly on the card, the cut is
@@ -70,6 +73,13 @@ Semantics at 1.1.4 (synced with upstream):
   `TypeError`/`ValueError`, …) and the edges survive. JSON results keep both
   streams, labelled stderr/stdout, and the failed block gains an
   `[exit code: N]` line.
+- **Failure-diagnostics completeness gate** (1.1.5): within the budget the
+  diagnostics are kept verbatim — no line-tail shortening, and a JSON result
+  keeps every field, not only the two streams; past the budget the earliest
+  failure line is retained alongside the last ones. If any failed result in
+  the span cannot be retained completely (truncated, squeezed out of the
+  shared budget, or omitted whole), the card is refused and the span stays.
+  An identified failed result is never pointerised on its own.
 - **Oversized tool results** (a single result over 32K tokens, adjustable)
   are not excerpted at all in local mode or during a cloud drain: the whole
   round is replaced by a pointer card that records only "call at sequence N → result at sequence M".
@@ -133,7 +143,7 @@ below 48K, and spans above 650K are out of the small cuts' scope
 ## Tests
 
 ```sh
-npm test   # node --test, 67 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
+npm test   # node --test, 81 cases covering the card builder, engine resolution, span selection, the recall archive, cooldown and handler wiring (handler cases need a resolvable "typebox" in node_modules — link Pi's bundled copy on a Pi machine)
 ```
 
 ## License and origin

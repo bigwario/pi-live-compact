@@ -1,4 +1,4 @@
-// Live Compact for Pi — a faithful port of dsh-live-compact 1.1.3
+// Live Compact for Pi — a faithful port of dsh-live-compact 1.1.5
 // (MIT, MerkyorLynn) to Pi's extension boundary API.
 //
 // The DSH original hooks its host's compaction engine on agent idle and
@@ -26,7 +26,11 @@
 // instance starts only primes the baseline and never yields (1.1.2,
 // PORTING.md #27). Failed tool results keep their exit code and the
 // key causes from both output streams on the card (1.1.2, PORTING.md
-// #26).
+// #26). 1.1.5 tightens that further (PORTING.md #30): diagnostics that
+// fit are kept verbatim, and a span whose failed diagnostics cannot
+// all be retained is not cut at all; identified failures are never
+// pointerised. The kept-rounds reservation now restarts after the
+// newest card (1.1.5, issue #36, PORTING.md #31).
 //
 // No model is called for the cuts themselves, exactly like the original's
 // spine cuts. When the card gate refuses (prose-heavy span), nothing is cut

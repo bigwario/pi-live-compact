@@ -438,6 +438,118 @@ test("buildCard does not require a user source that still stands verbatim in liv
   assert.equal(card.hardCount, 0);
 });
 
+test("keptToolRounds restarts after the newest checkpoint (1.1.5, issue #36)", () => {
+  const events: RoundEvent[] = [
+    { type: "other", toolCalls: 1, checkpoint: false },
+    { type: "tool", toolCalls: 0 },
+    { type: "other", toolCalls: 0, checkpoint: true },
+    { type: "other", toolCalls: 1, checkpoint: false },
+    { type: "tool", toolCalls: 0 },
+    { type: "other", toolCalls: 1, checkpoint: false },
+    { type: "tool", toolCalls: 0 },
+  ];
+  assert.deepEqual(keptToolRounds(events, 3, 2), [{ start: 3, end: 4 }, { start: 5, end: 6 }]);
+});
+
+test("failureKeptLines keeps the earliest marked line when over budget (1.1.5, issue #33)", () => {
+  // The earliest marked line is neither the first useful line nor a
+  // *CAUSE line, so the old last-8 selection (plus edges and causes)
+  // dropped it; 1.1.5 keeps the first marked line explicitly.
+  const text = [
+    "starting the nightly build",
+    "Error: EARLY_FIRST_FAILURE",
+    ...Array.from({ length: 10 }, (_, i) => `Error: downstream ${i} ${"x".repeat(260)}`),
+    "final context",
+  ].join("\n");
+  const kept = failureKeptLines(text);
+  assert.ok(kept.some((line) => line.includes("EARLY_FIRST_FAILURE")));
+});
+
+// ---- 1.1.5 failure-diagnostics completeness (issue #33), adapted from
+// upstream test/failed-diagnostics.test.mjs ----
+const failTool = (text: string, extra: Partial<CardSpan> = {}): CardSpan => ({ role: "toolResult", text, isError: true, ...extra });
+const failCard = (spans: CardSpan[]) => buildCard("", "", spans);
+const refusedForDiagnostics = (value: ReturnType<typeof buildCard>) => {
+  assert.equal(value.ok, false);
+  assert.equal(value.failureDiagnosticsComplete, false);
+  assert.ok(value.missing.some((line) => line.includes("failed-tool-diagnostics-not-retained")));
+};
+
+test("a failed diagnostic line keeps its suffix when the complete body fits (1.1.5)", () => {
+  const line = `Error: ${"x".repeat(300)} END_OF_LINE_DIAGNOSTIC`;
+  const text = [line, ...Array.from({ length: 13 }, (_, i) => `context ${i}`)].join("\n");
+  assert.ok(failureKeptLines(text).includes(line));
+  const value = failCard([failTool(text)]);
+  assert.equal(value.ok, true);
+  assert.equal(value.failureDiagnosticsComplete, true);
+  assert.ok(value.text.includes(line));
+});
+
+test("framing cannot silently clip a diagnostic that fit the line selection budget (1.1.5)", () => {
+  const text = `Error: ${"x".repeat(2340)} END_MARKER`;
+  assert.equal(failureKeptLines(text).join("\n"), text);
+  const span = failTool(text, { command: "command ".repeat(20) });
+  assert.equal(toolExcerpt([span]).failureDiagnosticsComplete, false);
+  refusedForDiagnostics(failCard([span]));
+});
+
+test("multiple failed tools cannot drop an older failure to fit a shared budget (1.1.5)", () => {
+  const spans = [failTool(`Error: OLDER_FAILURE ${"a".repeat(1400)}`), failTool(`Error: NEWER_FAILURE ${"b".repeat(1400)}`)];
+  assert.equal(toolExcerpt(spans).failureDiagnosticsComplete, false);
+  refusedForDiagnostics(failCard(spans));
+});
+
+test("over-budget diagnostics stay bounded previews and refuse an executable card (1.1.5)", () => {
+  const text = ["Error: wrapper failed", ...Array.from({ length: 20 }, (_, i) => `Error: frame ${i} ${"x".repeat(200)}`), "ROOT_CAUSE=missing setting"].join("\n");
+  const preview = toolExcerpt([failTool(text)]);
+  assert.ok(preview.text.length <= 2400);
+  assert.equal(preview.failureDiagnosticsComplete, false);
+  refusedForDiagnostics(failCard([failTool(text)]));
+});
+
+test("structured nonzero output keeps both streams when they fit (1.1.5)", () => {
+  const text = JSON.stringify({ exitCode: 23, stdout: { text: "STDOUT_CAUSE=missing setting" }, stderr: { text: "STDERR_CAUSE=wrapper failed" } });
+  const value = failCard([failTool(text, { isError: false })]);
+  assert.equal(value.ok, true);
+  assert.equal(value.failureDiagnosticsComplete, true);
+  assert.ok(value.text.includes("STDOUT_CAUSE"));
+  assert.ok(value.text.includes("STDERR_CAUSE"));
+  assert.ok(value.text.includes("[exit code: 23]"));
+});
+
+test("budget-sized structured failures retain diagnostic fields outside both streams (1.1.5)", () => {
+  const text = JSON.stringify({ exitCode: 23, stderr: { text: "Error: wrapper failed" }, stdout: { text: "ordinary detail ".repeat(50) }, errorDetail: "ROOT_FIELD_SENTINEL" });
+  const value = failCard([failTool(text, { isError: false })]);
+  assert.equal(value.ok, true);
+  assert.equal(value.failureDiagnosticsComplete, true);
+  assert.ok(value.text.includes("ROOT_FIELD_SENTINEL"));
+  assert.ok(value.text.includes(text), "no unknown JSON field is silently dropped");
+});
+
+test("short streams cannot certify an over-budget structured failure as complete (1.1.5)", () => {
+  const text = JSON.stringify({ exitCode: 23, stderr: { text: "Error: wrapper failed" }, stdout: { text: "short output" }, diagnostic: "other failure context ".repeat(300) });
+  refusedForDiagnostics(failCard([failTool(text, { isError: false })]));
+});
+
+test("pointer labels agree with the nonzero-exit failure classifier (1.1.5)", () => {
+  const span = failTool("Error: POINTER_ROOT_CAUSE\n[exit code: 1]", { isError: false, seq: 2, callSeq: 1, name: "shell" });
+  assert.ok(pointerOnlyText([span]).includes("result 2 error"));
+  assert.ok(failCard([span]).text.includes("result 2 error"));
+});
+
+test("ordinary output mentioning errors stays eligible under the existing unknown-state rule (1.1.5)", () => {
+  const value = failCard([failTool("File documentation: Error: is an example\n".repeat(100), { isError: false })]);
+  assert.equal(value.ok, true);
+  assert.equal(value.failureDiagnosticsComplete, true);
+});
+
+test("a complete failed diagnostic already retained in live context does not veto the card (1.1.5)", () => {
+  const text = `Error: diagnostic retained outside the cut\n${"context\n".repeat(500)}`;
+  const value = buildCard(text, text, [failTool(text)]);
+  assert.equal(value.ok, true);
+  assert.equal(value.failureDiagnosticsComplete, true);
+});
+
 test("buildCard keeps a protected fact from a tool result and counts omitted ordinary lines", () => {
   const filler = Array.from({ length: 20 }, (_, i) => `ordinary log line ${i} with nothing special`).join("\n");
   const card = buildCard("span", "", [
