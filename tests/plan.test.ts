@@ -63,6 +63,20 @@ test("buildCard ok when a hard line survives in live context", () => {
   assert.equal(card.missing.length, 0);
 });
 
+test("a version-like assistant token alone does not veto the card (1.1.6)", () => {
+  const spans: CardSpan[] = [{ role: "assistant", text: "部署在 us-east-1，用的是 claude-3-5-sonnet 这个型号" }];
+  const card = buildCard(spans[0].text, "", spans);
+  assert.equal(card.ok, true);
+  assert.equal(card.missing.length, 0);
+});
+
+test("an assistant decision line still vetoes the card (1.1.6)", () => {
+  const spans: CardSpan[] = [{ role: "assistant", text: "决定固定为 us-east-1，不再切区域" }];
+  const card = buildCard(spans[0].text, "", spans);
+  assert.equal(card.ok, false);
+  assert.equal(card.missing.length, 1);
+});
+
 test("assistant prose claims never become hard lines (1.0.6 claims rule)", () => {
   const userText = "alphaWidget 的规则：alphaWidget must never be mutated after creation.";
   const assistantText = "搞定，alphaWidget must be shipped now，我已经发布了。";

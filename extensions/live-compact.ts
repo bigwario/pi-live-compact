@@ -193,15 +193,30 @@ export default function liveCompact(pi: any) {
     const projected = event.context?.contextEntries ?? [];
     let work = toSpanEntries(projected);
     const hostTotal = typeof usage?.tokens === "number" ? usage.tokens : work.reduce((sum, e) => sum + e.tokens, 0);
-    if (hostTotal < MIN_PRESSURE || hostTotal >= BIG_GATE) return;
+    // Settle the growth baseline on every pass that stands down, so a stale
+    // baseline never survives an idle gap (upstream 1.1.6).
+    const settleBaseline = () => {
+      turnBase = hostTotal;
+      maxTurnGrowth = 0;
+    };
+    if (hostTotal < MIN_PRESSURE || hostTotal >= BIG_GATE) {
+      settleBaseline();
+      return;
+    }
 
     // Cooldown (1.0.9, baseline rule 1.1.2): a fresh official compaction
     // makes this pass yield once, so its summary is not rolled into a
     // spine card right away; one already present at the first pass is
     // restored history and never yields.
     const official = latestOfficialCompaction(projected);
-    if (compactionTracker.observe(official)) return;
-    if (inCooldownWindow(official, COOLDOWN_MS)) return;
+    if (compactionTracker.observe(official)) {
+      settleBaseline();
+      return;
+    }
+    if (inCooldownWindow(official, COOLDOWN_MS)) {
+      settleBaseline();
+      return;
+    }
 
     const { engine } = engineFor(ctx);
     const cloud = engine !== "local";

@@ -134,6 +134,17 @@ export function hasProtectedToolFact(line: string): boolean {
   return /必须|不要|禁止|口令|方案|[a-z]{2,}-[a-z0-9]+-\d+|\bpinned\s+to\b/i.test(line);
 }
 
+// A model/version/region token by itself is ordinary prose. Only veto a cut
+// for an assistant line that carries a decision verb or the explicit Chinese
+// plan form; otherwise `us-east-1` and `claude-3-5` would block every card
+// that mentions them (upstream 1.1.6).
+function unresolvedAssistantDecision(line: string): boolean {
+  const text = String(line || "");
+  if (/方案\s*[A-Za-z0-9]/.test(text)) return true;
+  if (/(?:决定|采用|选用|选择|固定为|改用|切换到|定为|使用|确定)/.test(text)) return true;
+  return /\b(?:pinned\s+to|decid(?:e|ed|es)|adopt(?:ed|s)?|selected|choose|chosen|will\s+use|must\s+use)\b/i.test(text);
+}
+
 export interface AttributedLine {
   sourceId?: number;
   role: string;
@@ -1064,7 +1075,7 @@ export function buildCard(spanText: string, liveText = "", spans: CardSpan[] | n
     if (source.role !== "assistant") continue;
     source.text.split(/\r?\n/).forEach((line) => {
       if (liveLines.has(line.trim())) return;
-      if (/[a-z]{2,}-[a-z0-9]+-\d+/i.test(line) || /方案\s*[A-Za-z0-9]/.test(line)) {
+      if (unresolvedAssistantDecision(line)) {
         coverage.ok = false;
         coverage.missing.push({ sourceId: source.id, text: line, reason: "assistant-decision-not-retained" });
       }

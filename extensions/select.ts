@@ -92,7 +92,10 @@ export interface Chunk {
 }
 
 export function isCardEntry(entry: SpanEntry): boolean {
-  return entry.text.includes(MARK);
+  // Upstream 1.1.6: the text marker only counts at the start of a message.
+  // A tool result or an ordinary sentence that merely mentions the marker
+  // must not create a permanent cut boundary.
+  return entry.text.trimStart().startsWith(MARK);
 }
 
 // Checkpoints stop span expansion and tail walks: our own cards, plus
@@ -199,9 +202,21 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   }, KEEP_ROUND_TOKENS);
   const cutEnd = span ? reservedCutEnd(visible[span.start].index, first) : null;
   if (span && cutEnd === null) return null;
-  let keptTokens = 0;
+  // `keptTokens` must describe the retained rounds to the right of the actual
+  // cut. A long-read cut can sit newer than the ordinary rounds selected
+  // above, and counting those older rounds made tailBeyondKept negative and
+  // disabled the tail guard (upstream 1.1.6).
+  const keptRoundsTokensAfter = (cutEndIndex: number): number => {
+    let tokens = 0;
+    for (const round of rounds) {
+      const roundStart = visible[round.start]?.index;
+      const roundEnd = visible[round.end]?.index;
+      if (!Number.isInteger(roundStart) || !Number.isInteger(roundEnd) || roundStart <= cutEndIndex) continue;
+      for (let index = roundStart; index <= roundEnd; index += 1) tokens += entries[index].tokens;
+    }
+    return tokens;
+  };
   if (cutEnd !== null && span) {
-    for (let index = visible[span.start].index; index <= visible[span.end].index; index += 1) keptTokens += entries[index].tokens;
     end = cutEnd;
     while (end >= first && entries[end].role === "user" && !(floorCard >= 0 && end - 1 <= floorCard)) end -= 1;
     if (floorCard >= 0 && end <= floorCard) return null;
@@ -324,7 +339,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
       end: resultAt,
       tokens: sumTokens(pairStart, resultAt),
       after: afterOf(resultAt),
-      keptTokens,
+      keptTokens: keptRoundsTokensAfter(resultAt),
       card,
       pointerOnly: true,
     };
@@ -343,7 +358,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     end: finalEnd,
     tokens: sumTokens(start, finalEnd),
     after: afterOf(finalEnd),
-    keptTokens,
+    keptTokens: keptRoundsTokensAfter(finalEnd),
     card,
   };
 }
