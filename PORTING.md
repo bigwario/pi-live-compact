@@ -43,4 +43,6 @@
 | 32 | 1.1.6 的可移植子集 | ①`unresolvedAssistantDecision`：助手行只有带决策动词或「方案 X」才否决整卡，`us-east-1`／`claude-3-5` 这类版本、区域 token 不再误杀；②`keptTokens` 改为按**实际切点**右侧的保留轮重算（长 read 刀可能比普通保留轮更新，旧写法把左侧轮算进去，`tailBeyondKept` 变负、尾巴门失效）；③`isCheckpoint` 的文本标记只认行首（工具结果或普通句子里提到 `Spine extract.` 不再形成永久切点地板）；④`finishTurn` 在每次 stand-down 时结算 turn 基线（`turnBase=实测`、`maxTurnGrowth=0`），避免空闲跨轮留下过期基线。其余 1.1.6 变更不移植：billion-context 共存 standDown（DSH 侧读 `bili-native`／`billion-context` 的实际 LOADING/ACTIVE 状态，Pi 扩展无同等查询面）、隔离组接管与 Include 加载、raw／owner／卡片的原子发布与完整性校验、worker 超时与 ACL 重试（#13／#25／#29 同族宿主机制）、`latestTurnCompleted`（Pi 的 `turn_end` 只在回合结束时触发，无 reason 判定需求）、model-level provider endpoint（#45，Pi 的 `ctx.model.baseUrl` 已是当前生效地址，见 #14） | plan.ts／select.ts／live-compact.ts 逐行同步；新增 4 条单测：版本型 token 不否决、决策行仍否决、工具结果提及标记不算卡、行首标记仍算卡 | 与上游 1.1.6 的算法语义一致；宿主机制差异沿用 #13／#25／#29 的归类 |
 
 
+| 33 | 1.1.7 的可移植子集 | ①`hasProtectedToolFact` 去掉版本号形态的硬事实识别（`[a-z]{2,}-[a-z0-9]+-\d+`），改认「部署区域」与 `region is/=`，减少把模型名当约束；②决策动词表去掉「使用／确定」两个高频词，只留明确的定案语；③工具摘录统一改称「不可信工具证据」，并在块头单列「不可信工具事实（不升级为用户约束）」；④长 read 刀被否后回退普通选段（`disableLongRead` 防止递归），不再整刀作废。其余 1.1.7 变更不移植：billion-context 共存让位（DSH 侧状态机）、raw/meta 重建、worker 超时锁隔离、维护让位（#49）、导出 package.json（#53） | plan.ts / select.ts；新增 1 条单测（工具证据标记＋硬事实列） | 与上游 1.1.7 的卡片语义一致；宿主机制差异沿用 #13／#25／#29 归类 |
+
 已知未覆盖：DSH 原版的 `SPINE_SHADOW_DIR`、`DSH_HOME` 环境变量在 Pi 版无对应物（见 #13）。

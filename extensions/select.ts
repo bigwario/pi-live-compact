@@ -152,6 +152,7 @@ export interface SelectOptions {
   engine?: string;
   totalTokens?: number;
   drain?: boolean;
+  disableLongRead?: boolean;
 }
 
 export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}): Chunk | null {
@@ -232,8 +233,13 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
   // span below is tried. That is intentional — never reach across a card
   // for one long read; the kept window slides right next turn and the
   // round becomes a candidate then.
+  // 1.1.7: a rejected long-read cut falls back to ordinary selection instead of
+  // dropping the pass entirely; `disableLongRead` keeps that fallback from
+  // recursing into the long-read path again.
+  const withoutLongRead = (): Chunk | null =>
+    opts.disableLongRead ? null : selectNewestChunk(entries, { ...opts, disableLongRead: true });
   const longSpan =
-    newestLong && visible[newestLong.start].index > floorCard
+    !opts.disableLongRead && newestLong && visible[newestLong.start].index > floorCard
       ? { start: visible[newestLong.start].index, end: visible[newestLong.end].index }
       : null;
   if (!longSpan && (end < first || isCheckpointEntry(entries[end]))) return null;
@@ -301,7 +307,7 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     if (!callId) return null;
     const pairStart = entries.findIndex((entry) => entry.toolCalls.includes(callId));
     if (pairStart < 0 || pairStart > resultAt) return null;
-    if (usedLongCut && longSpan && pairStart < longSpan.start) return null;
+    if (usedLongCut && longSpan && pairStart < longSpan.start) return withoutLongRead();
     if (!pointerSpanAllowed(items, pairStart, resultAt, engine)) return null;
     if (items[pairStart].balancedBefore === false) return null;
     // Port-side guard (PORTING.md): replacing the call entry also drops any
@@ -345,13 +351,13 @@ export function selectNewestChunk(entries: SpanEntry[], opts: SelectOptions = {}
     };
   }
 
-  if (usedLongCut && longSpan && (picked.start < longSpan.start || picked.end > longSpan.end)) return null;
+  if (usedLongCut && longSpan && (picked.start < longSpan.start || picked.end > longSpan.end)) return withoutLongRead();
 
   const start = picked.start;
   const finalEnd = picked.end;
   if (isCheckpointEntry(entries[start])) return null;
   const card = buildCard(spanText(start, finalEnd), liveText(start, finalEnd), spanObjs(start, finalEnd));
-  if (!card.ok) return null;
+  if (!card.ok) return usedLongCut ? withoutLongRead() : null;
   if (!balancedAfter(entries, start, finalEnd)) return null;
   return {
     start,

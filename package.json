@@ -1,6 +1,6 @@
 {
   "name": "pi-live-compact",
-  "version": "1.1.6+port.0.9.1",
+  "version": "1.1.7+port.0.9.2",
   "description": "Live Compact for Pi: cut the newest finished chunk in place at 20K tokens with a local extractive card — no model call, prefix cache preserved. Ported from dsh-live-compact 1.1.5, portable 1.1.6 fixes (MIT, MerkyorLynn).",
   "license": "MIT",
   "type": "module",
